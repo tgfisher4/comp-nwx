@@ -53,13 +53,18 @@ int main(void)
 	char s[INET6_ADDRSTRLEN];
 	int rv;
 
+    if( argc != 2 ){
+        fprintf(stderr, "[Error] Usage: %s port", argv[0]);
+    }
+    char *port = argv[1]
+
 	memset(&hints, 0, sizeof hints);
 	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_STREAM;
 	hints.ai_flags = AI_PASSIVE; // use my IP
 
-	if ((rv = getaddrinfo(NULL, PORT, &hints, &servinfo)) != 0) {
-		fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
+	if ((rv = getaddrinfo(NULL, port, &hints, &servinfo)) != 0) {
+		fprintf(stderr, "[Error] Failed to getaddrinfo: %s\n", gai_strerror(rv));
 		return 1;
 	}
 
@@ -67,19 +72,19 @@ int main(void)
 	for(p = servinfo; p != NULL; p = p->ai_next) {
 		if ((sockfd = socket(p->ai_family, p->ai_socktype,
 				p->ai_protocol)) == -1) {
-			perror("server: socket");
+			perror("[Error] Failed to create socket");
 			continue;
 		}
 
 		if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &yes,
 				sizeof(int)) == -1) {
-			perror("setsockopt");
+			perror("[Error] Failed to setsockopt");
 			exit(1);
 		}
 
 		if (bind(sockfd, p->ai_addr, p->ai_addrlen) == -1) {
 			close(sockfd);
-			perror("server: bind");
+			perror("[Error] Failed to bind a socket");
 			continue;
 		}
 
@@ -89,12 +94,12 @@ int main(void)
 	freeaddrinfo(servinfo); // all done with this structure
 
 	if (p == NULL)  {
-		fprintf(stderr, "server: failed to bind\n");
+		fprintf(stderr, "[Error] Failed to bind any socket");
 		exit(1);
 	}
 
 	if (listen(sockfd, BACKLOG) == -1) {
-		perror("listen");
+		perror("[Error] Failed to listen");
 		exit(1);
 	}
 
@@ -102,29 +107,29 @@ int main(void)
 	sigemptyset(&sa.sa_mask);
 	sa.sa_flags = SA_RESTART;
 	if (sigaction(SIGCHLD, &sa, NULL) == -1) {
-		perror("sigaction");
+		perror("[Error] Failed to set sigaction");
 		exit(1);
 	}
 
-	printf("server: waiting for connections...\n");
+	printf("[INFO] Waiting for connections...\n");
 
 	while(1) {  // main accept() loop
 		sin_size = sizeof their_addr;
 		new_fd = accept(sockfd, (struct sockaddr *)&their_addr, &sin_size);
 		if (new_fd == -1) {
-			perror("accept");
+			perror("[Error] Failed to accept connection");
 			continue;
 		}
 
 		inet_ntop(their_addr.ss_family,
 			get_in_addr((struct sockaddr *)&their_addr),
 			s, sizeof s);
-		printf("server: got connection from %s\n", s);
+		printf("[INFO] Accepted connection from %s\n", s);
 
 		if (!fork()) { // this is the child process
 			close(sockfd); // child doesn't need the listener
-			if (send(new_fd, "Hello, world!", 13, 0) == -1)
-				perror("send");
+            // receive filename len
+            client_handler(new_fd);
 			close(new_fd);
 			exit(0);
 		}
@@ -132,4 +137,72 @@ int main(void)
 	}
 
 	return 0;
+}
+
+void client_handler(int sockfd){
+    // receive filename len
+    # define filename_len_len 2 // move to header?
+    uint32_t filename_len[1];
+    for( int recvd = 0; recvd < filesize_len_len; ){
+        int got = recv(sockfd, filename_len + recvd, filename_len_len - recvd), 0);
+        if( got < 0 ){
+            perror("[Error] Failed to receive file length");
+            return -1
+        }
+        revd += got;
+    }
+    filename_len = ntohl(filename_len);
+
+    // receive filename
+    char *filename = malloc(filename_len);
+    for( int recvd = 0; recvd < filesize; ){
+        int got = recv(sockfd, filename + recvd, filename_len - recvd, 0);
+        if( got < 0 ){
+            perror("[Error] Failed to receive file contents");
+            return -1;
+        }
+        if( got == 0 ){
+            fprintf(stderr, "[Error] Filename stream ended unexpectedly (got %d, expected %d)\n", recvd, filename_len);
+            return -1;
+        }
+        revd += got;
+    }
+
+    // send file length
+    FILE *file = fopen(filename, "r");
+    fseek(file, 0, SEEK_END);
+    size_t file_len = ftell(file);
+    if( file_len >= (1 << 32) ){
+        fprintf(stderr, "[Error] File %s too large to be sent (greater than 2^32 B)\n", recvd, filename_len);
+        return -1;
+    }
+    uint32_t file_len_32b = htonl((uint32_t)file_len);
+    for( int sent = 0; sent < 4; ){
+        int put = send(sockfd, &file_len_32b + sent, 4 - sent, 0);
+        if( put < 0 ) {
+                perror("[Error] Failed to send filename size");
+                return -1;
+        }
+        sent += put;
+    }
+
+    // send file
+    fseek(file, 0, SEEK_SET);
+    char buf[BUFSIZ];
+    int got;
+    while( got = read(file, buf, BUFSIZ) ){
+        if( got < 0 ){
+            perror("[Error] Failed to read file chunk");
+            return -1;
+        }
+
+        for( int sent = 0; sent < got; ){
+            int put = send(sockfd, buf + sent, BUFSIZ - sent, 0);
+            if( put < 0 ) {
+                    perror("[Error] Failed to send file chunk");
+                    return -1;
+            }
+            sent += put;
+        }
+    }
 }
