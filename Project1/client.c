@@ -38,9 +38,9 @@ int main(int argc, char *argv[])
 	    fprintf(stderr,"[Error] Usage: %s host port filename\n", argv[0]);
 	    exit(1);
 	}
-    hostname = argv[1];
-    port = argv[2];
-    filename = argv[3];
+    	const char* hostname = argv[1];
+    	const char* port = argv[2];
+    	const char* filename = argv[3];
 
 	memset(&hints, 0, sizeof hints);
 	hints.ai_family = AF_UNSPEC;
@@ -80,82 +80,82 @@ int main(int argc, char *argv[])
 	freeaddrinfo(servinfo); // all done with this structure
 
     // send size of filename
-    size_t filename_sz = strlen(filename);
-    if( size_t >= 1 << 16 ){
-        fprintf(stderr, "[Error] Filename is too long: must be shorter than 2^16 characters.");
-        return -1;
-    }
-    uint16_t filename_sz_16b = htons((uint16_t)filename_sz);
-    for( int sent = 0; sent < 2; ){
-        int put = send(sockfd, &filename_sz_16b + sent, 2 - sent, 0);
-        if( put < 0 ) {
-            perror("[Error] Failed to send filename size: ")
-            return -1;
-        }
-        sent += put;
-    }
+    	size_t filename_sz = strlen(filename);
+    	if( size_t >= 1 << 16 ){
+        	fprintf(stderr, "[Error] Filename is too long: must be shorter than 2^16 characters.");
+        	return -1;
+    	}
+	uint16_t filename_sz_16b = htons((uint16_t)filename_sz);
+    	for( int sent = 0; sent < 2; ){
+        	int put = send(sockfd, &filename_sz_16b + sent, 2 - sent, 0);
+        	if( put < 0 ) {
+            		perror("[Error] Failed to send filename size: ")
+            		return -1;
+        	}
+        	sent += put;
+    	}
 
     // send filename
-    for( int sent = 0; sent < filename_sz; ){
-        int put = send(sockfd, filename + sent, filename_sz - sent, 0);
-        if( put < 0 ){
-            perror("[Error] Failed to send filename size: ");
-            return -1;
-        }
-        sent += put;
-    }
+    	for( int sent = 0; sent < filename_sz; ){
+        	int put = send(sockfd, filename + sent, filename_sz - sent, 0);
+        	if( put < 0 ){
+            		perror("[Error] Failed to send filename size: ");
+            		return -1;
+        	}
+        	sent += put;
+    	}
 
     // receive filesize
-    # define filesize_len 4
-    for( int recvd = 0; recvd < filesize_len; ){
-        int got = recv(sockfd, buf+recvd, min(BUFSIZ, filesize_len - recvd + 1), 0);
-        if( got < 0 ){
-            perror("[Error] Failed to receive file length: ");
-            return -1
-        }
-        revd += got;
-    }
-    uint32_t filesize = ntohl(*(uint32_t *)buf);
+    	# define filesize_len 4
+    	for( int recvd = 0; recvd < filesize_len; ){
+        	int got = recv(sockfd, buf+recvd, min(BUFSIZ, filesize_len - recvd + 1), 0);
+        	if( got < 0 ){
+            		perror("[Error] Failed to receive file length: ");
+            		return -1
+        	}
+        	recvd += got;
+    	}
+    	uint32_t filesize = ntohl(*(uint32_t *)buf);
     
     // start timer
-    struct timeval start;
-    if( gettimeofday(&start, NULL) < 0 ){
-        perror("[Error] Failed to fetch start time: ");
-        return -1;
-    }
+    	struct timeval start;
+    	if( gettimeofday(&start, NULL) < 0 ){
+		perror("[Error] Failed to fetch start time: ");
+		return -1;
+    	}
 
     // receive file
-    int recvd = 0; // declare outside loop to have access later
-    for( ; recvd < filesize; ){
-        int got = recv(sockfd, buf, min(BUFSIZ, filesize - recvd + 1), 0);
-        if( got < 0 ){
-            perror("[Error] Failed to receive file contents: ");
-            return -1;
-        }
-        if( got == 0 ){
-            fprintf(stderr, "[Error] File stream ended unexpectedly");
-            return -1;
-        }
-        revd += got;
+    	int recvd = 0; // declare outside loop to have access later
+    	for( ; recvd < filesize; ){
+        	int got = recv(sockfd, buf, min(BUFSIZ, filesize - recvd + 1), 0);
+        	if( got < 0 ){
+            		perror("[Error] Failed to receive file contents: ");
+            		return -1;
+        	}
+        	if( got == 0 ){
+		    fprintf(stderr, "[Error] File stream ended unexpectedly");
+		    return -1;
+        	}
+        	recvd += got;
         // don't actually need to store file anywhere
-    }
+    	}
 
     // stop timer
-    struct timeval end;
-    if( gettimeofday(&end, NULL) < 0 ){
-        perror("[Error] Failed to fetch end time: ");
-        return -1;
-    }
+    	struct timeval end;
+    	if( gettimeofday(&end, NULL) < 0 ){
+		perror("[Error] Failed to fetch end time: ");
+		return -1;
+    	}
 
     // output throughput statistics
-    double transfer_time = (end.tv_usec - start.tv_usec)/1000000.0;
-    if( tranfer_time < 0 ){
-        end.tv_sec -= 1;
-        transfer_time = 1 - transfer_time;
-    }
-    transfer_time += end.tv_sec - start.tv_sec;
-    double throughput = recvd / transfer_time; // B/sec
-    printf("[Success] %d bytes received in %fs (%f B/s)\n", recvd, transfer_time, throughput);
+    	double transfer_time = (end.tv_usec - start.tv_usec)/1000000.0;
+    	if( tranfer_time < 0 ){
+		end.tv_sec -= 1;
+		transfer_time = 1 - transfer_time;
+    	}
+    	transfer_time += end.tv_sec - start.tv_sec;
+    	double throughput = recvd / transfer_time; // B/sec
+    	printf("[Success] %d bytes received in %fs (%f B/s)\n", recvd, transfer_time, throughput);
 
 	close(sockfd);
 
