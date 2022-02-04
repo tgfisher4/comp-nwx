@@ -17,7 +17,9 @@
 #include <arpa/inet.h>
 
 #define MAXDATASIZE BUFSIZ // max number of bytes we can get at once 
-#define min(x, y) ((x) > (y) ? (x) : (y))
+#define min(x, y) ((x) > (y) ? (y) : (x))
+#define filename_len_len sizeof(uint16_t)
+#define file_len_len sizeof(uint32_t)
 
 // get sockaddr, IPv4 or IPv6:
 void *get_in_addr(struct sockaddr *sa)
@@ -88,42 +90,45 @@ int main(int argc, char *argv[])
         fprintf(stderr, "[Error] Filename is too long: must be shorter than 2^16 characters.");
         return -1;
     }
-    // TODO:
+
     uint16_t filename_len_16b = htons((uint16_t)filename_len);
-    for( int sent = 0; sent < 2; ){
-        // cast uint16_t* to void* so that points arithmetic doesn't get messed up: can just move pointer by bytes
-        int put = send(sockfd, (void *)&filename_len_16b + sent, 2 - sent, 0);
+    for( size_t sent = 0; sent < filename_len_len; ){
+        // cast uint16_t* to void* so that ptr arithmetic doesn't get messed up: can just move pointer by bytes
+        int put = send(sockfd, (void *)&filename_len_16b + sent, filename_len_len - sent, 0);
         if( put < 0 ) {
             perror("[Error] Failed to send filename length");
             return -1;
         }
-        sent += put;
+        sent += put; // adding signed to unsigned: should be fine bc positive
     }
 
     // send filename
-    for( int sent = 0; sent < filename_len; ){
+    for( size_t sent = 0; sent < filename_len; ){
         int put = send(sockfd, filename + sent, filename_len - sent, 0);
         if( put < 0 ){
-            perror("[Error] Failed to send filename size");
+            perror("[Error] Failed to send filename");
             return -1;
         }
-        sent += put;
+        sent += put; // adding signed to unsigned: should be fine bc positive
     }
 
     // receive file length
-    # define file_len_len 4
-    char file_len_buf[file_len_len];
-    for( int recvd = 0; recvd < file_len_len; ){
-        int got = recv(sockfd, file_len_buf + recvd, file_len_len - recvd, 0);
+    uint32_t file_len;
+    for( size_t recvd = 0; recvd < file_len_len; ){
+        int got = recv(sockfd, (void *)&file_len + recvd, file_len_len - recvd, 0);
         if( got < 0 ){
             perror("[Error] Failed to receive file length");
             return -1;
         }
         recvd += got;
     }
-    uint32_t file_len = ntohl(*(uint32_t *)file_len_buf);
+    file_len = ntohl(file_len);
 
     FILE *save_file = fopen(filename, "w");
+    if( !save_file ){
+        perror("[Error] Could not open local save file");
+        return -1;
+    }
     
     // start timer
     struct timeval start;
@@ -133,7 +138,7 @@ int main(int argc, char *argv[])
     }
 
     // receive file
-    int recvd = 0; // declare outside loop to have access later
+    size_t recvd = 0; // declare outside loop to have access later
     for( ; recvd < file_len; ){
         int got = recv(sockfd, buf, min(MAXDATASIZE, file_len - recvd), 0);
         if( got < 0 ){
@@ -161,12 +166,13 @@ int main(int argc, char *argv[])
     // output throughput statistics
     double transfer_time = (end.tv_usec - start.tv_usec)/1000000.0;
     if( transfer_time < 0 ){
-    end.tv_sec -= 1;
-    transfer_time = 1 - transfer_time;
+        end.tv_sec -= 1;
+        transfer_time = 1 - transfer_time;
     }
     transfer_time += end.tv_sec - start.tv_sec;
     double throughput = recvd / transfer_time; // B/sec
-    printf("[Success] %d bytes received in %fs (%f B/s)\n", recvd, transfer_time, throughput);
+    double MiB_throughput = throughput / 1048576.0;
+    printf("[Success] %zu bytes received in %fs (%f MiB/s)\n", recvd, transfer_time, MiB_throughput);
 
     close(sockfd);
 

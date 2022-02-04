@@ -15,8 +15,10 @@
 #include <sys/wait.h>
 #include <signal.h>
 
-#define PORT "3490"  // the port users will be connecting to
 #define BACKLOG 10   // how many pending connections queue will hold
+#define filename_len_len sizeof(uint16_t)
+#define file_len_len sizeof(uint32_t)
+
 
 void sigchld_handler(int s)
 {
@@ -142,23 +144,20 @@ int main(int argc, char* argv[])
 
 int client_handler(int sockfd){
     // receive filename len
-    # define filename_len_len 2 // move to header?
-    char filename_len_buf[filename_len_len];
-    for( int recvd = 0; recvd < filename_len_len; ){
-        int got = recv(sockfd, filename_len_buf + recvd, filename_len_len - recvd, 0);
+    uint16_t filename_len;
+    for( size_t recvd = 0; recvd < filename_len_len; ){
+        int got = recv(sockfd, (void *)&filename_len + recvd, filename_len_len - recvd, 0);
         if( got < 0 ){
             perror("[Error] Failed to receive file length");
             return -1;
         }
         recvd += got;
     }
-    uint32_t filename_len = ntohl(*(uint32_t *)filename_len_buf);
+    filename_len = ntohs(filename_len);
 
     // receive filename
     char *filename = malloc((size_t)filename_len);
-    int recvd = 0;
-    // TODO: is signed/unsigned comparison ok?
-    // cursory research suggests should be ok as long as int is positive (o/w will interpret 2s complement bits as unsigned and thus large)
+    size_t recvd = 0;
     for( ; recvd < filename_len; ){
         int got = recv(sockfd, filename + recvd, filename_len - recvd, 0);
         if( got < 0 ){
@@ -166,14 +165,19 @@ int client_handler(int sockfd){
             return -1;
         }
         if( got == 0 ){
-            fprintf(stderr, "[Error] Filename stream ended unexpectedly (got %d, expected %d)\n", recvd, filename_len);
+            fprintf(stderr, "[Error] Filename stream ended unexpectedly (got %zu, expected %d)\n", recvd, filename_len);
             return -1;
         }
-        recvd += got;
+        recvd += got; // adding signed to unsigned: should be fine as long as positive (negative is 2s complement: large)
     }
 
     // send file length
     FILE *file = fopen(filename, "r");
+    if( !file ){
+        perror("[Error] Could not open file to transfer");
+        return -1;
+    }
+
     fseek(file, 0, SEEK_END);
     size_t file_len = ftell(file);
     if( file_len >= (1UL << 32) ){
@@ -181,9 +185,9 @@ int client_handler(int sockfd){
         return -1;
     }
     uint32_t file_len_32b = htonl((uint32_t)file_len);
-    for( int sent = 0; sent < 4; ){
+    for( size_t sent = 0; sent < file_len_len; ){
         // cast uint32_t* to void* to have access to raw ptr arithmetic
-        int put = send(sockfd, (void *)&file_len_32b + sent, 4 - sent, 0);
+        int put = send(sockfd, (void *)&file_len_32b + sent, file_len_len - sent, 0);
         if( put < 0 ) {
             perror("[Error] Failed to send filename size");
             return -1;
@@ -201,7 +205,7 @@ int client_handler(int sockfd){
             return -1;
         }
 
-        for( int sent = 0; sent < got; ){
+        for( size_t sent = 0; sent < got; ){
             int put = send(sockfd, buf + sent, BUFSIZ - sent, 0);
             if( put < 0 ) {
                 perror("[Error] Failed to send file chunk");
@@ -210,5 +214,6 @@ int client_handler(int sockfd){
             sent += put;
         }
     }
+    printf("[INFO] Successfully sent %s.\n", filename);
     return 0;
 }
