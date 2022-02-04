@@ -8,9 +8,11 @@
 #include <errno.h>
 #include <string.h>
 #include <netdb.h>
+#include <fcntl.h>
 #include <sys/types.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 
 #include <arpa/inet.h>
 
@@ -81,7 +83,7 @@ int main(int argc, char *argv[])
 
     // send length of filename
     size_t filename_len = strlen(filename);
-    if( filename_length >= (1 << 16) ){
+    if( filename_len >= (1 << 16) ){
         fprintf(stderr, "[Error] Filename is too long: must be shorter than 2^16 characters.");
         return -1;
     }
@@ -89,15 +91,15 @@ int main(int argc, char *argv[])
     for( int sent = 0; sent < 2; ){
         int put = send(sockfd, &filename_len_16b + sent, 2 - sent, 0);
         if( put < 0 ) {
-            perror("[Error] Failed to send filename length")
+            perror("[Error] Failed to send filename length");
             return -1;
         }
         sent += put;
     }
 
     // send filename
-    for( int sent = 0; sent < filename_sz; ){
-        int put = send(sockfd, filename + sent, filename_sz - sent, 0);
+    for( int sent = 0; sent < filename_len; ){
+        int put = send(sockfd, filename + sent, filename_len - sent, 0);
         if( put < 0 ){
             perror("[Error] Failed to send filename size");
             return -1;
@@ -112,13 +114,13 @@ int main(int argc, char *argv[])
         int got = recv(sockfd, file_len + recvd, file_len_len - recvd, 0);
         if( got < 0 ){
             perror("[Error] Failed to receive file length");
-            return -1
+            return -1;
         }
-        revd += got;
+        recvd += got;
     }
     uint32_t file_len = ntohl(*(uint32_t *)buf);
 
-    FILE *save_file = open(filename, "w");
+    FILE *save_file = fopen(filename, 'w');
     
     // start timer
     struct timeval start;
@@ -139,10 +141,10 @@ int main(int argc, char *argv[])
             fprintf(stderr, "[Error] File stream ended unexpectedly\n");
             return -1;
         }
-        revd += got;
+        recvd += got;
         // save file locally
         if( fwrite(buf, sizeof(char), got, save_file) < got ){
-            perror"[Error] Fatal fwrite error");
+            perror("[Error] Fatal fwrite error");
         }
     }
 
@@ -155,7 +157,7 @@ int main(int argc, char *argv[])
 
     // output throughput statistics
     double transfer_time = (end.tv_usec - start.tv_usec)/1000000.0;
-    if( tranfer_time < 0 ){
+    if( transfer_time < 0 ){
     end.tv_sec -= 1;
     transfer_time = 1 - transfer_time;
     }

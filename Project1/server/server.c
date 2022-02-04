@@ -42,7 +42,7 @@ void *get_in_addr(struct sockaddr *sa)
 	return &(((struct sockaddr_in6*)sa)->sin6_addr);
 }
 
-int main(void)
+int main(int argc, char* argv[])
 {
 	int sockfd, new_fd;  // listen on sock_fd, new connection on new_fd
 	struct addrinfo hints, *servinfo, *p;
@@ -56,7 +56,7 @@ int main(void)
     if( argc != 2 ){
         fprintf(stderr, "[Error] Usage: %s port", argv[0]);
     }
-    char *port = argv[1]
+    char *port = argv[1];
 
 	memset(&hints, 0, sizeof hints);
 	hints.ai_family = AF_UNSPEC;
@@ -144,28 +144,29 @@ void client_handler(int sockfd){
     # define filename_len_len 2 // move to header?
     uint32_t filename_len[1];
     for( int recvd = 0; recvd < filesize_len_len; ){
-        int got = recv(sockfd, filename_len + recvd, filename_len_len - recvd), 0);
+        int got = recv(sockfd, filename_len + recvd, filename_len_len - recvd, 0);
         if( got < 0 ){
             perror("[Error] Failed to receive file length");
-            return -1
+            return;
         }
-        revd += got;
+        recvd += got;
     }
     filename_len = ntohl(filename_len);
 
     // receive filename
-    char *filename = malloc(filename_len);
-    for( int recvd = 0; recvd < filesize; ){
+    char *filename = malloc((size_t)filename_len);
+		int recvd = 0;
+    for( ; recvd < filesize; ){
         int got = recv(sockfd, filename + recvd, filename_len - recvd, 0);
         if( got < 0 ){
             perror("[Error] Failed to receive file contents");
-            return -1;
+            return;
         }
         if( got == 0 ){
             fprintf(stderr, "[Error] Filename stream ended unexpectedly (got %d, expected %d)\n", recvd, filename_len);
-            return -1;
+            return;
         }
-        revd += got;
+        recvd += got;
     }
 
     // send file length
@@ -173,15 +174,15 @@ void client_handler(int sockfd){
     fseek(file, 0, SEEK_END);
     size_t file_len = ftell(file);
     if( file_len >= (1 << 32) ){
-        fprintf(stderr, "[Error] File %s too large to be sent (greater than 2^32 B)\n", recvd, filename_len);
-        return -1;
+        fprintf(stderr, "[Error] File %s too large to be sent (greater than 2^32 B)\n", filename);
+        return;
     }
     uint32_t file_len_32b = htonl((uint32_t)file_len);
     for( int sent = 0; sent < 4; ){
         int put = send(sockfd, &file_len_32b + sent, 4 - sent, 0);
         if( put < 0 ) {
                 perror("[Error] Failed to send filename size");
-                return -1;
+                return;
         }
         sent += put;
     }
@@ -193,14 +194,14 @@ void client_handler(int sockfd){
     while( got = fread(buf, sizeof(char), BUFSIZ, file) ){
         if( got < 0 ){
             perror("[Error] Failed to read file chunk");
-            return -1;
+            return;
         }
 
         for( int sent = 0; sent < got; ){
             int put = send(sockfd, buf + sent, BUFSIZ - sent, 0);
             if( put < 0 ) {
                     perror("[Error] Failed to send file chunk");
-                    return -1;
+                    return;
             }
             sent += put;
         }
