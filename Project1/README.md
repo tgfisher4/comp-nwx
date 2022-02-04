@@ -1,8 +1,8 @@
-Note that contrary to the instructions, the make command builds the proj1client and proj2client executables in the client and server folders, respectively.
+Note that contrary to the instructions, the make command builds the `proj1client` and `proj2client` executables in the client and server folders, respectively.
 This is because if both were in the root directory, one cannot tell if the file was actually transfered.
 So to run the project, first execute make in the Project1 directory.
-Then, to run the client, execute cd client; ./proj1client <host> <port> <file>
-Likewise, to run the server, execute cd server; ./proj1server <port>
+Then, to run the client, execute `cd client; ./proj1client <host> <port> <file>`.
+Likewise, to run the server, execute `cd server; ./proj1server <port>`.
 
 
 
