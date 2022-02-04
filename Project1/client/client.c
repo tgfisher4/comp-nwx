@@ -16,7 +16,8 @@
 
 #include <arpa/inet.h>
 
-#define MAXDATASIZE 100 // max number of bytes we can get at once 
+#define MAXDATASIZE BUFSIZ // max number of bytes we can get at once 
+#define min(x, y) ((x) > (y) ? (x) : (y))
 
 // get sockaddr, IPv4 or IPv6:
 void *get_in_addr(struct sockaddr *sa)
@@ -30,7 +31,7 @@ void *get_in_addr(struct sockaddr *sa)
 
 int main(int argc, char *argv[])
 {
-    int sockfd, numbytes;  
+    int sockfd;
     char buf[MAXDATASIZE];
     struct addrinfo hints, *servinfo, *p;
     int rv;
@@ -83,13 +84,15 @@ int main(int argc, char *argv[])
 
     // send length of filename
     size_t filename_len = strlen(filename);
-    if( filename_len >= (1 << 16) ){
+    if( filename_len >= (1U << 16) ){
         fprintf(stderr, "[Error] Filename is too long: must be shorter than 2^16 characters.");
         return -1;
     }
+    // TODO:
     uint16_t filename_len_16b = htons((uint16_t)filename_len);
     for( int sent = 0; sent < 2; ){
-        int put = send(sockfd, &filename_len_16b + sent, 2 - sent, 0);
+        // cast uint16_t* to void* so that points arithmetic doesn't get messed up: can just move pointer by bytes
+        int put = send(sockfd, (void *)&filename_len_16b + sent, 2 - sent, 0);
         if( put < 0 ) {
             perror("[Error] Failed to send filename length");
             return -1;
@@ -109,18 +112,18 @@ int main(int argc, char *argv[])
 
     // receive file length
     # define file_len_len 4
-    char file_len[file_len_len];
+    char file_len_buf[file_len_len];
     for( int recvd = 0; recvd < file_len_len; ){
-        int got = recv(sockfd, file_len + recvd, file_len_len - recvd, 0);
+        int got = recv(sockfd, file_len_buf + recvd, file_len_len - recvd, 0);
         if( got < 0 ){
             perror("[Error] Failed to receive file length");
             return -1;
         }
         recvd += got;
     }
-    uint32_t file_len = ntohl(*(uint32_t *)buf);
+    uint32_t file_len = ntohl(*(uint32_t *)file_len_buf);
 
-    FILE *save_file = fopen(filename, 'w');
+    FILE *save_file = fopen(filename, "w");
     
     // start timer
     struct timeval start;
@@ -131,8 +134,8 @@ int main(int argc, char *argv[])
 
     // receive file
     int recvd = 0; // declare outside loop to have access later
-    for( ; recvd < filesize; ){
-        int got = recv(sockfd, buf, min(BUFSIZ, filesize - recvd), 0);
+    for( ; recvd < file_len; ){
+        int got = recv(sockfd, buf, min(MAXDATASIZE, file_len - recvd), 0);
         if( got < 0 ){
             perror("[Error] Failed to receive file contents");
             return -1;

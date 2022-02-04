@@ -1,5 +1,8 @@
 all: client server
 
+clean:
+	rm -f client/client server/server
+
 .PHONY: client server
 
 client: client/client.c
