@@ -117,6 +117,8 @@ int main(int argc, char *argv[])
         revd += got;
     }
     uint32_t file_len = ntohl(*(uint32_t *)buf);
+
+    FILE *save_file = open(filename, "w");
     
     // start timer
     struct timeval start;
@@ -138,7 +140,10 @@ int main(int argc, char *argv[])
             return -1;
         }
         revd += got;
-        // don't actually need to store file anywhere
+        // save file locally
+        if( fwrite(buf, sizeof(char), got, save_file) < got ){
+            perror"[Error] Fatal fwrite error");
+        }
     }
 
     // stop timer

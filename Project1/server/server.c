@@ -190,7 +190,7 @@ void client_handler(int sockfd){
     fseek(file, 0, SEEK_SET);
     char buf[BUFSIZ];
     int got;
-    while( got = read(file, buf, BUFSIZ) ){
+    while( got = fread(buf, sizeof(char), BUFSIZ, file) ){
         if( got < 0 ){
             perror("[Error] Failed to read file chunk");
             return -1;
