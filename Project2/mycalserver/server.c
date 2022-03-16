@@ -15,10 +15,14 @@
 #include <sys/wait.h>
 #include <signal.h>
 
+#include <jansson.h> // the JSON parsing library we chose to use: https://jansson.readthedocs.io/en/latest | https://github.com/akheron/jansson
+
 #define BACKLOG 10   // how many pending connections queue will hold
 #define filename_len_len sizeof(uint16_t)
 #define file_len_len sizeof(uint32_t)
 #define CONFIG_PATH .mycal
+
+int MONTH_TO_N_DAYS = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]; // ignores leap years
 
 
 void sigchld_handler(int s)
@@ -124,25 +128,53 @@ void save_data(char *data_path, json_t *data){
     json_dumpf(data, data_file, JSON_COMPACT);
 }
 
-char *add_event(json_t *data, char *calendar_name, char *date, char *time, char duration_min, char *name, char *description, char *location){
+bool str_to_int(char *str, int *int_out){
+    char *end_of_int;
+    int res = strtol(str, &end_of_int, 0);
+    if( end_of_int != duration_min + strlen(duration_min) ){
+        return false;
+    }
+    if( int_out ) *int_out = res;
+    return true;
+}
+
+/*** Action function return schemes ***/
+// Things we need to communicate back to caller
+//  - success?
+//  - err msg (string)
+//  - result (any type)
+// However, success can be inferred from the absence of an error.
+// Therefore, to facilitate easy error-checking, I suggest that every function return their error message (or NULL on success).
+// This leaves the result to be passed back via a parameter.
+char *add_event(char **event_id_out, json_t *data, char *calendar_name, char *date, char *time, char *duration_min, char *name, char *description, char *location){
     // Use strings for internal storage of ALL fields for simplicity
+
+    /*** Validation ***/
+    // TODO: how to actually return these
+    if( !validate_date(date, NULL, NULL, NULL) ){
+        return "invalid date (expected MMDDYY)";
+    }
+    if( !validate_time(time, NULL, NULL) ){
+        return "invalid time (expected HHMM)";
+    }
+    if( !str_to_int(duration_min, NULL) ){
+        return "invalid duration (expected integer)";
+    }
     
+    /*** If no event has been added to date yet, create a date array ***/
     json_t *calendar = json_object_get(data, calendar_name); // returns a "borrowed" reference: no need to worry about manual ref counting
-    
-    /* If no event has been added to date yet, create a date array */
     // Initialize new array for <date>
     json_t *new_date = json_object();
     json_object_set_new(new_date, date, json_array());
     // Attempt to insert new <date> array: calendar will only be updated (i.e., <date> set to an empty array) if there is currently no field called <date>
     json_object_update_missing_new(calendar, new_date); // new_date is stolen by "new": no need to decref
 
-    /* Now that date array definitely exists, grab it and append the new event */
+    /*** Now that date array definitely exists, grab it and append the new event ***/
     json_t *cal_date = json_object_get(calendar, date);
     int id_on_date = json_array_size(cal_date); // save for later
 
     // Create a new event and add the expected fields
     json_t *new_event = json_object();
-    // TODO: validate inputs
     json_object_set_new(new_event, "time", json_string(time));
     json_object_set_new(new_event, "duration_min", json_string(duration_min));
     json_object_set_new(new_event, "name", json_string(name));
@@ -152,28 +184,32 @@ char *add_event(json_t *data, char *calendar_name, char *date, char *time, char 
     
     json_array_append_new(cal_date, new_event); // hands off reference to calendar
 
-    // Construct event id from date and id_on_date
-    char *event_id = malloc(6 + ceil(log10(id_on_date)) + 1); // 6 = len(MMDDYY), 1 = len("\0")
-    sprintf(event_id, "%s:%d", date, id_on_date);
+    if( event_id_out ){
+        // Construct event id from date and id_on_date
+        char *event_id = malloc(6 + ceil(log10(id_on_date)) + 1); // 6 = len(MMDDYY), 1 = len("\0")
+        sprintf(event_id, "%s:%d", date, id_on_date);
 
-    return event_id;
+        *event_id_out = event_id;
+    }
+
+    return NULL;
 }
 
 int parse_event_id(char *event_id, char *date, int *id_on_date){
-    // date and id_on_date MUST be preallocated with spaces of 6 chars for date and 1 int for id_on_date
+    // date and id_on_date MUST be preallocated with spaces of 7 chars for date and 1 int for id_on_date
     // TODO: validate event_id and return error if invalid?
     strncpy(date, event_id, 6);
+    date[6] = '\0';
     *id_on_date = atoi(event_id + 7);
     return 0;
 }
 
-int remove_event(json_t *data, char *calendar_name, char *event_id){
+char *remove_event(json_t *data, char *calendar_name, char *event_id){
     // TODO: do I need to get access to old value of "removed" and decref?
     char date[7], int id_on_date;
-    date[6] = '\0';
     parse_event_id(event_id, date, &id_on_date);
 
-    json_object_set_new(
+    int rc = json_object_set_new(
         json_array_get(
             json_object_get(json_object_get(data, calendar_name), date),
             id_on_date
@@ -181,15 +217,28 @@ int remove_event(json_t *data, char *calendar_name, char *event_id){
         "removed",
         json_true()
     );
-    return 0;
+    if( rc < 0 ) return "no such event exists on this calendar";
+    return NULL;
 }
 
-int update_event(json_t *data, char *calendar_name, int event_id, char* field, char *value){
+char *update_event(json_t *data, char *calendar_name, int event_id, char* field, char *value){
     char date[7], int id_on_date;
-    date[6] = '\0';
     parse_event_id(event_id, date, &id_on_date);
 
-    json_object_set_new(
+    /*** Validate field and value ***/
+    if( !strcmp(field, "date") ){ 
+    }
+    else if( !strcmp(field, "time") ){
+    }
+    else if( !strcmp(field, "duration"){
+    }
+    else if( !strcmp(field, "name") || !strcmp(field, "description") || !strcmp(field, "location") ){
+    }
+    else
+        return "field is invalid (must be one of: date, time, duration, name, description, location)";
+
+    /*** Perform update ***/
+    int rc = json_object_update_existing_new( // will only succeed if field already existed in event (i.e., is a valid field)
         json_array_get(
             json_object_get(json_object_get(data, calendar_name), date),
             id_on_date
@@ -197,31 +246,340 @@ int update_event(json_t *data, char *calendar_name, int event_id, char* field, c
         field,
         json_string(value)
     );
-    return 0;
+    if( rc < 0 ) return "no such event exists on this calendar" 
+    return NULL;
 }
 
-json_t *get_events_on_date(json_t *data, char *calendar_name, char *date){
+char *get_events_on_date(json_t **results_out, json_t *data, char *calendar_name, char *date){
+    if( !validate_date(date, NULL, NULL, NULL) ){
+        return "date invalid (expected MMDDYY)";
+    }
+
     // Getting all events on a date is very easy thanks to our data structure
     json_t *events_on_date = json_object_get(json_object_get(data, calendar_name), date);
+    // If calendar does not exist (i.e., has no events) or this date does not exist in the calendar (i.e., has no events), return an empty array (signifies no events)
+    if( !events_on_date ) events_on_date = json_array();
     
-    // However, to account for our 'removed' field, we must filter out removed events before returning the results
-    json_t *results = json_array();
-    json_t *true_obj = json_true();
-    json_array_foreach(events_on_date, index, value){
-        if( !json_equal(json_object_get(value, "removed"), true_obj) ){
-            json_array_append(results, value);
+    if( results_out ){
+        // However, to account for our 'removed' field, we must filter out removed events before returning the results
+        json_t *results = json_array();
+        json_t *true_obj = json_true();
+        json_array_foreach(events_on_date, index, value){
+            if( !json_equal(json_object_get(value, "removed"), true_obj) ){
+                json_array_append(results, value);
+            }
         }
-    }
-    json_decref(true_obj);
+        json_decref(true_obj);
 
-    return results;
+        // Wrap in an object to tack on numevents field
+        json_t *to_return = json_object();
+        json_object_set_new("numevents", json_integer(json_array_size(results))); // hand over reference
+        json_object_set_new("events", results); // hand over reference
+
+        *results_out = to_return; // caller will need to decref to free everything
+    }
+
+    return NULL;
 }
 
 
-int get_events_in_range(
+char *get_events_in_range(json_t **results_out, json_t *data, char *calendar_name, chra *start_date, char *end_date){
     // Qs:
     //  - start/stop inclusive or exclusive?
     //  - what is output format (are all events contained in one object? are events nested into objects depending on the day?)? it includes a numdays field? why? Should it be a map of date to a list of events? Or just an array of arrays of events, where the caller can determine which fall on which day based on order and start date
+    int month, day, year;
+    if( !validate_date(start_date, &month, &day, &year) ){
+        return "start date invalid (expected MMDDYY)";
+    }
+    int end_month, end_day, end_year;
+    if( !validate_date(end_date, &end_month, &end_day, &end_year) ){
+        return "end date invalid (expected MMDDYY)";
+    }
+    bool start_after_end = (end_year < year) || (end_year == year && end_month < month) || (end_year == year && end_month == month && end_day < day);
+    if( start_after_end ){
+        return "end date precedes start date (expected end date to follow start date)";
+    }
+
+    if( results_out ){
+        json_t *to_return = json_object();
+        int num_days = 0;
+        // TODO: this setup currently uses an inclusive start and exclsuive stop (as is a common paradigm) - is this ok?
+        for(; !(day == end_day && month == end_month && year == end_year); num_days++ ){
+            char date[7];
+            sprintf(date, "%2d%2d%2d", day, month, year);
+            json_t *events_today = get_events_on_date(data, calendar_name, date);
+            json_object_set_new(to_return, date, events_today); // hand reference to to_return
+
+            // Advance to next day, ignoring leap years
+            day = (day % MONTH_TO_N_DAYS[month]) + 1;
+            bool is_new_month = day == 1;
+            if( is_new_month ) month = (month % 12) + 1;
+            bool is_new_year = is_new_month && month = 1;
+            if( is_new_year ) year = (year % 99) + 1; 
+        }
+        json_object_set_new(to_return, "numdays", json_integer(num_days)); // hand reference over
+        *results_out = to_return; // caller will need to decref to free everything
+    }
+    return NULL;
+}
+
+json_t *dispatch(json_t *request){
+    json_t *result = json_object();
+    char *command;
+    // TODO: do these error payloads need to include XXXX identifier?
+    if( !(command := json_string_value(json_object_get(request, "command"))) ){
+        // BAD REQUEST: NO COMMAND
+        json_object_set_new(result, "success", json_false());
+        json_object_set_new(result, "error", json_string("Request payload is missing 'command' field"));
+        return result;
+    }
+    json_object_set("command", json_object_get(request, "command")); // points to same command json_string as request.command
+
+    char *calendar_name;
+    if( !(calendar_name := json_string_value(json_object_get(request, "calendar"))) ){
+        // BAD REQUEST: NO CALENDAR
+        json_object_set_new(result, "success", json_false());
+        json_object_set_new(result, "error", json_string("Request payload is missing 'calendar' field"));
+        return result;
+    }
+    json_object_set("calendar", json_object_get(request, "calendar")); // points to same command json_string as request.calendar
+
+    if( !strcmp(command, "add") ){
+        char *calendar_name, *date, *time, *duration_min, *name, *description = NULL, *location = NULL;
+        int rc = json_unpack("{"
+                "s:s,"
+                "s:s,"
+                "s:s,"
+                "s:s,"
+                "s:s,"
+                "s?:s,"
+                "s?:s"
+            "}",
+            "calendar", &calendar_name,
+            "date", &date,
+            "time", &time,
+            "duration", &duration_min,
+            "name", &name,
+            "description", &description,
+            "location", &location
+        );
+        if( rc < 0 ){
+            // BAD REQUEST: WRONG FORMAT
+            json_object_set_new(result, "success", json_false());
+            json_object_set_new(result, "error", json_string("Invalid request format: expected keys of calendar, date, time, duration, name, and, optionally, description and location, each with a string value."));
+            json_object_set_new(result, "identifier", json_string("XXXX"));
+            return result;
+        }
+        char *added_event_id;
+        char *error = add_event(
+            &added_event_id,
+            data,
+            calendar_name,
+            date,
+            time,
+            duration_min,
+            name,
+            description,
+            location
+        );
+        // Finish constructing result
+        json_object_set_new(result, "success", json_bool(!error));
+        if( error ){
+            json_object_set_new(result, "error", json_string(error));
+            json_object_set_new(result, "identifier", json_string("XXXX"));
+        }
+        else {
+            json_object_set_new(result, "identifier", json_string(event_id));
+        }
+        return result;
+    }
+    if( !strcmp(command, "remove") ){
+        char *calendar_name, *event_id;
+        int rc = json_unpack("{
+                s:s,
+                s:s,
+            }",
+            "calendar", &calendar_name,
+            "event_id", &event_id
+        );
+        if( rc < 0 ){
+            // BAD REQUEST: WRONG FORMAT
+            json_object_set_new(result, "success", json_false());
+            json_object_set_new(result, "error", json_string("Invalid request format: expected keys of calendar and event_id, each with a string value."));
+            json_object_set_new(result, "identifier", json_string("XXXX"));
+            return result;
+        }
+
+        char *error = remove_event(
+            data,
+            calendar_name,
+            event_id
+        )
+        // Finish constructing result
+        json_object_set_new(result, "success", json_bool(!error));
+        if( error ){
+            json_object_set_new(result, "error", json_string(error));
+            json_object_set_new(result, "identifier", json_string("XXXX"));
+        }
+        else {
+            json_object_set_new(result, "identifier", json_string(event_id));
+        }
+        return result; 
+    }
+    if( !strcmp(command, "update") ){
+        char *calendar_name, *event_id, *field, *value;
+        int rc = json_unpack("{
+                s:s,
+                s:s,
+                s:s,
+                s:s
+            }",
+            "calendar", &calendar_name,
+            "event_id", &event_id
+            "field", &field,
+            "value", &value
+        );
+        if( rc < 0 ){
+            // BAD REQUEST: WRONG FORMAT
+            json_object_set_new(result, "success", json_false());
+            json_object_set_new(result, "error", json_string("Invalid request format: expected keys of calendar, event_id, field, and value, each with a string value."));
+            json_object_set_new(result, "identifier", json_string("XXXX"));
+            return result;
+        }
+        char *error = update_event(
+            data,
+            calendar_name,
+            event_id,
+            field,
+            value
+        )
+        // Finish constructing result
+        json_object_set_new(result, "success", json_bool(!error));
+        if( error ){
+            json_object_set_new(result, "error", json_string(error));
+            json_object_set_new(result, "identifier", json_string("XXXX"));
+        }
+        else {
+            json_object_set_new(result, "identifier", json_string(event_id));
+        }
+        return result; 
+    }
+    if( !strcmp(command, "get") ){
+        char *calendar_name, *date;
+        int rc = json_unpack("{
+                s:s,
+                s:s,
+                s:s
+            }",
+            "calendar", &calendar_name,
+            "event_id", &event_id
+            "date", &date
+        );
+        if( rc < 0 ){
+            // BAD REQUEST: WRONG FORMAT
+            json_object_set_new(result, "success", json_false());
+            json_object_set_new(result, "error", json_string("Invalid request format: expected keys of calendar, event_id, and date, each with a string value."));
+            //json_object_set_new(result, "identifier", json_string("XXXX"));
+            return result;
+        }
+        json_t *events_on_date;
+        char *error = get_events_on_date(
+            &events_on_date,
+            data,
+            calendar_name,
+            date
+        )
+        // Finish constructing result
+        json_object_set_new(result, "success", json_bool(!error));
+        if( error ){
+            json_object_set_new(result, "error", json_string(error));
+            //json_object_set_new(result, "identifier", json_string("XXXX"));
+        }
+        else {
+            json_object_set_new(result, "data", events_on_date); // give ownership of queried data events_on_date to result
+        }
+        return result; 
+        // remember to free events_on_date at some point (after encoding results onto wire)
+    }
+    if( !strcmp(command, "getrange") ){
+        char *calendar_name, *start_date, end_date;
+        int rc = json_unpack("{
+                s:s,
+                s:s,
+                s:s
+            }",
+            "calendar", &calendar_name,
+            "event_id", &event_id
+            "start_date", &start_date,
+            "end_date", &end_date
+        );
+        if( rc < 0 ){
+            // BAD REQUEST: WRONG FORMAT
+            json_object_set_new(result, "success", json_false());
+            json_object_set_new(result, "error", json_string("Invalid request format: expected keys of calendar, event_id, start_date, and end_date, each with a string value."));
+            //json_object_set_new(result, "identifier", json_string("XXXX"));
+            return result;
+        }
+        json_t *events_on_dates;
+        char *error = get_events_in_range(
+            &events_on_dates,
+            data,
+            calendar_name,
+            start_date,
+            end_date
+        )
+        // Finish constructing result
+        json_object_set_new(result, "success", json_bool(!error));
+        if( error ){
+            json_object_set_new(result, "error", json_string(error));
+            //json_object_set_new(result, "identifier", json_string("XXXX"));
+        }
+        else {
+            json_object_set_new(result, "data", events_on_dates); // give ownership of queried data events_on_dates to result
+        }
+        return result; 
+        // remember to free events_on_date at some point
+    }
+}
+    
+
+bool validate_date( char* date, int *month_out, int *day_out, int *year_out ){
+    if( strlen(date) != 6 ){
+        return false;
+    }
+    char month_str[3], day_str[3], year_str[3]; 
+    sscanf(date, "%2s%2s%2s", month_str, day_str, year_str); // sscanf adds NULs to parsed strings
+    int month = atoi(month_str);
+    int day = atoi(day_str);
+    int year = atoi(year_str);
+
+    if( month <= 0 || month > 12 ) return false;
+    if( day <= 0 || day > MONTH_TO_N_DAYS[month] ) return false;
+    // any year is valid
+
+    if( month_out ) *month_out = month;
+    if( day_out ) *day_out = day;
+    if( year_out ) *year_out = year;
+    return true;
+}
+
+bool validate_time( char *time, int *hour_out, int *minute_out ){
+    if( strlen(time) != 4 ){
+        return false;
+    }
+    char hour_str[3], minute_str[3]; 
+    sscanf(date, "%2s%2s", hour_str, minute_str); // sscanf adds NULs to parsed strings
+    int hour = atoi(hour_str);
+    int minute = atoi(minute_str);
+
+    if( hour <= 0 || hour > 23 ) return false;
+    if( minute <= 0 || minute > 59 ) return false;
+
+    if( hour_out ) *hour_our = hour;
+    if( minute_out ) *minute_out = minute;
+    return true;
+}
+
 
 int main(int argc, char* argv[])
 {
@@ -234,11 +592,12 @@ int main(int argc, char* argv[])
     char s[INET6_ADDRSTRLEN];
     int rv;
 
+    // TODO: implement multithreading, probably requiring a lock
     if( argc > 2 || (argc == 2 && strcmp(argv[1], "-mt")) ){
         fprintf(stderr, "[Error] Usage: %s [-mt]", argv[0]);
     }
 
-    char *port = get_port_from_cfg(CONFIG_PATH); // TODO: free
+    char *port = get_port_from_cfg(CONFIG_PATH);
 
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_UNSPEC;
@@ -286,7 +645,7 @@ int main(int argc, char* argv[])
         exit(1);
     }
 
-    /* Might be able to remove if threading instead */
+    /* Might be able to remove SIGCHD handler if threading instead of forking */
     sa.sa_handler = sigchld_handler; // reap all dead processes
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_RESTART;
@@ -312,9 +671,9 @@ int main(int argc, char* argv[])
             s, sizeof s);
         printf("[INFO] Accepted connection from %s\n", s);
 
+        // TODO: refactor to multi-thread, not fork
         if (!fork()) { // this is the child process
             close(sockfd); // child doesn't need the listener
-            // receive filename len
             int rc = client_handler(new_fd);
             close(new_fd);
             exit(rc);
@@ -326,7 +685,7 @@ int main(int argc, char* argv[])
 }
 
 json_t *get_next_request(int sockfd){
-    static char *buffer = malloc(BUFSIZ)
+    static char *buffer = malloc(BUFSIZ);
     static int space_remaining = BUFSIZ; // essentially tracks end of meaningful data in buffer
     int current_bufsiz_multiple = 1; // resets to 1 on every invocation
     do {
@@ -357,83 +716,15 @@ json_t *get_next_request(int sockfd){
 
         // Receive more data to try to find end of request
         int got = recv(sockfd, buffer + (current_bufsiz_multiple * BUFSIZ - space_remaining), space_remaining);
-        // ERRCHECK
+        // TODO: ERRCHECK
         space_remaining -= got;
     } while(true);
 }
 
 int client_handler(int sockfd){
-    // receive filename len
-    uint16_t filename_len;
-    for( size_t recvd = 0; recvd < filename_len_len; ){
-        int got = recv(sockfd, (void *)&filename_len + recvd, filename_len_len - recvd, 0);
-        if( got < 0 ){
-            perror("[Error] Failed to receive file length");
-            return -1;
-        }
-        recvd += got;
-    }
-    filename_len = ntohs(filename_len);
-
-    // receive filename
-    char *filename = malloc((size_t)filename_len);
-    size_t recvd = 0;
-    for( ; recvd < filename_len; ){
-        int got = recv(sockfd, filename + recvd, filename_len - recvd, 0);
-        if( got < 0 ){
-            perror("[Error] Failed to receive file contents");
-            return -1;
-        }
-        if( got == 0 ){
-            fprintf(stderr, "[Error] Filename stream ended unexpectedly (got %zu, expected %d)\n", recvd, filename_len);
-            return -1;
-        }
-        recvd += got; // adding signed to unsigned: should be fine as long as positive (negative is 2s complement: large)
-    }
-
-    // send file length
-    FILE *file = fopen(filename, "r");
-    if( !file ){
-        perror("[Error] Could not open file to transfer");
-        return -1;
-    }
-
-    fseek(file, 0, SEEK_END);
-    size_t file_len = ftell(file);
-    if( file_len >= (1UL << 32) ){
-        fprintf(stderr, "[Error] File %s too large to be sent (greater than 2^32 B)\n", filename);
-        return -1;
-    }
-    uint32_t file_len_32b = htonl((uint32_t)file_len);
-    for( size_t sent = 0; sent < file_len_len; ){
-        // cast uint32_t* to void* to have access to raw ptr arithmetic
-        int put = send(sockfd, (void *)&file_len_32b + sent, file_len_len - sent, 0);
-        if( put < 0 ) {
-            perror("[Error] Failed to send filename size");
-            return -1;
-        }
-        sent += put;
-    }
-
-    // send file
-    fseek(file, 0, SEEK_SET);
-    char buf[BUFSIZ];
-    int got;
-    while( (got = fread(buf, sizeof(char), BUFSIZ, file)) ){
-        if( got < 0 ){
-            perror("[Error] Failed to read file chunk");
-            return -1;
-        }
-
-        for( size_t sent = 0; sent < got; ){
-            int put = send(sockfd, buf + sent, BUFSIZ - sent, 0);
-            if( put < 0 ) {
-                perror("[Error] Failed to send file chunk");
-                return -1;
-            }
-            sent += put;
-        }
-    }
-    printf("[INFO] Successfully sent %s.\n", filename);
-    return 0;
+    // TODO: implement
+    // while true:
+    //  get_next_request
+    //  dispatch
+    //  encode json result and send to client
 }
