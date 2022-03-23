@@ -1,0 +1,7 @@
+{
+				"commands": ["remove FA34J9A4",
+				"update FA34J9A4 location 'DeBartolo 319'",
+				"update FA34J9A4 duration 75",
+				"get 022322",
+				"getrange 022322 022522"]
+}
