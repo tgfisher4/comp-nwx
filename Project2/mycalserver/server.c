@@ -18,25 +18,19 @@
 #include <jansson.h> // the JSON parsing library we chose to use: https://jansson.readthedocs.io/en/latest | https://github.com/akheron/jansson
 
 #define BACKLOG 10   // how many pending connections queue will hold
-#define filename_len_len sizeof(uint16_t)
-#define file_len_len sizeof(uint32_t)
 #define CONFIG_PATH .mycal
+#define DATA_PATH data/all_data.json
 
 int MONTH_TO_N_DAYS = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]; // ignores leap years
 
+json_t *data; // global data shared among threads
+pthread_rwlock_t lock = PTHREAD_RWLOCK_INITIALIZER; // rd/wr lock associated with data
 
-void sigchld_handler(int s)
-{
-    (void)s; // quiet unused variable warning
-
-    // waitpid() might overwrite errno, so we save and restore it:
-    int saved_errno = errno;
-
-    while(waitpid(-1, NULL, WNOHANG) > 0);
-
-    errno = saved_errno;
+void sigint_handler(int s){
+    (void)s;
+    save_data(DATA_PATH, data);
+    exit(1);
 }
-
 
 // get sockaddr, IPv4 or IPv6:
 void *get_in_addr(struct sockaddr *sa)
@@ -52,9 +46,9 @@ int client_handler(int clientsockfd);
 
 char *get_port_from_cfg(char *cfg_pathname){
     /*** Read port from cfg file ***/
-
-    // get cfg file size
-    FILE *cfg_file = fopen(filename, "r");
+    
+    // parse json cfg file
+    FILE *cfg_file = fopen(cfg_pathname, "r");
     json_t *cfg_contents = json_loadf(cfg_file, 0, NULL); 
     if( !cfg_contents ){
         perror("[Error] Could not open config file"); // TODO: prolly don't throw errors from helper fxn, just return -1 and let fxn above check errno
@@ -65,38 +59,39 @@ char *get_port_from_cfg(char *cfg_pathname){
     if( !port_json ){
         // error: field not found
     }
-    if( !json_is_integer(port_json) ){
-        // error: port should have int type
-    }
-    int port = json_integer_value(port_json);
+
+    char *port = json_string_value(port_json); // need to be const char *?
+    // copy over port so it is not lost when cfg_contents destroyed
+    char *port_to_return = malloc(strlen(port)+1); // caller needs to free returned string
+    sprintf(port_to_return, "%i", port); // sprintf adds a nul terminator
+
     // cleanup
-    json_decref(cfg_contents);
-    json_decref(port_json);
+    json_decref(cfg_contents); // frees port_json, too (borrowed reference)
     fclose(cfg_file);
 
-    // convert int to string
-    char *port_string = malloc(ceil(log10(port)) + 1);
-    sprintf(port_string, "%i", port); // sprintf adds a nul terminator
-    return port_string;
+    return port_to_return;
 }
 
-#define DATA_LOCATION data/all_data.json
 
 json_t *load_data(char *data_path){
     // try to load data
-    FILE *data_file = fopen(data_path);
+    FILE *data_file = fopen(data_path, "r");
     if( !data_file && errno == ENOENT ){
         // create directory if doesn't exist: I think it would make more sense to be lazier and create dir just before saving but instructions suggest this approach
         // parse until slash
         char *last_slash = strrchr(data_path, '/');
         char* dir_path = malloc(last_slash - data_path + 1);
-        strncpy(dir_path, data_path, last_slash - data_path);
-        dir_path[last_slash - data_path] = '\0';
+        snprintf(dir_path, last_slash - data_path, "%s", data_path); // writes a nul termiantor
+        //strncpy(dir_path, data_path, last_slash - data_path);
+        //dir_path[last_slash - data_path] = '\0';
         mkdir(data_path, S_IRWXU);
-        // check failure?
+        // TODO: check failure?
+        free(dir_path);
+        return json_object(); // no data to load
     }
     json_t *data = json_loadf(data_file);
     // TODO: integrity check on data after loading?
+    fclose(data_file);
     return data;
 
     // IDEA for data formatting :
@@ -123,9 +118,11 @@ json_t *load_data(char *data_path){
 
 void save_data(char *data_path, json_t *data){
     // TODO: integrity check on data before saving?
-
+    // TODO: how does multithreading interact with signals? can multiple threads be running this handler?
+    pthread_rwlock_rdlock(lock);
     FILE *data_file = fopen(data_path, 'w');
     json_dumpf(data, data_file, JSON_COMPACT);
+    pthread_rwlock_unlock(lock);
 }
 
 bool str_to_int(char *str, int *int_out){
@@ -150,27 +147,31 @@ char *add_event(char **event_id_out, json_t *data, char *calendar_name, char *da
     // Use strings for internal storage of ALL fields for simplicity
 
     /*** Validation ***/
-    // TODO: how to actually return these
     if( !validate_date(date, NULL, NULL, NULL) ){
-        return "invalid date (expected MMDDYY)";
+        return "invalid date (expected 'MMDDYY')";
     }
     if( !validate_time(time, NULL, NULL) ){
-        return "invalid time (expected HHMM)";
+        return "invalid time (expected 'HHMM')";
     }
     if( !str_to_int(duration_min, NULL) ){
-        return "invalid duration (expected integer)";
+        return "invalid duration (expected integer-convertible string)";
     }
-    
-    /*** If no event has been added to date yet, create a date array ***/
-    json_t *calendar = json_object_get(data, calendar_name); // returns a "borrowed" reference: no need to worry about manual ref counting
-    // Initialize new array for <date>
-    json_t *new_date = json_object();
-    json_object_set_new(new_date, date, json_array());
-    // Attempt to insert new <date> array: calendar will only be updated (i.e., <date> set to an empty array) if there is currently no field called <date>
-    json_object_update_missing_new(calendar, new_date); // new_date is stolen by "new": no need to decref
 
-    /*** Now that date array definitely exists, grab it and append the new event ***/
+    pthread_rwlock_wrlock(&lock);
+    // If no event has been added to calendar yet, create a calendar object
+    json_t *calendar = json_object_get(data, calendar_name);
+    if( !calendar ){
+        calendar = json_object();
+        json_object_set_new(data, calendar_name, calendar); // ref stolen by "new": no need to decref later
+    }
+    // If not event has been added to this date in the calendar yet, create a date array
     json_t *cal_date = json_object_get(calendar, date);
+    if( !cal_date ){
+        cal_date = json_array();
+        json_object_set_new(calendar, date, cal_date); // ref stolen by "new": no need to decref later
+    }
+
+    /*** Now that we have a cal_date array, and append the new event ***/
     int id_on_date = json_array_size(cal_date); // save for later
 
     // Create a new event and add the expected fields
@@ -183,6 +184,7 @@ char *add_event(char **event_id_out, json_t *data, char *calendar_name, char *da
     json_object_set_new(new_event, "removed", json_false());
     
     json_array_append_new(cal_date, new_event); // hands off reference to calendar
+    pthread_rwlock_unlock(&lock);
 
     if( event_id_out ){
         // Construct event id from date and id_on_date
@@ -209,6 +211,7 @@ char *remove_event(json_t *data, char *calendar_name, char *event_id){
     char date[7], int id_on_date;
     parse_event_id(event_id, date, &id_on_date);
 
+    pthread_rwlock_wrlock(&lock);
     int rc = json_object_set_new(
         json_array_get(
             json_object_get(json_object_get(data, calendar_name), date),
@@ -217,6 +220,8 @@ char *remove_event(json_t *data, char *calendar_name, char *event_id){
         "removed",
         json_true()
     );
+    pthread_rwlock_unlock(&lock);
+
     if( rc < 0 ) return "no such event exists on this calendar";
     return NULL;
 }
@@ -226,6 +231,7 @@ char *update_event(json_t *data, char *calendar_name, int event_id, char* field,
     parse_event_id(event_id, date, &id_on_date);
 
     /*** Validate field and value ***/
+    // TODO: fill in skeleton
     if( !strcmp(field, "date") ){ 
     }
     else if( !strcmp(field, "time") ){
@@ -238,6 +244,7 @@ char *update_event(json_t *data, char *calendar_name, int event_id, char* field,
         return "field is invalid (must be one of: date, time, duration, name, description, location)";
 
     /*** Perform update ***/
+    pthread_rwlock_wrlock(&lock);
     int rc = json_object_update_existing_new( // will only succeed if field already existed in event (i.e., is a valid field)
         json_array_get(
             json_object_get(json_object_get(data, calendar_name), date),
@@ -246,6 +253,7 @@ char *update_event(json_t *data, char *calendar_name, int event_id, char* field,
         field,
         json_string(value)
     );
+    pthread_rwlock_unlock(&lock);
     if( rc < 0 ) return "no such event exists on this calendar" 
     return NULL;
 }
@@ -255,12 +263,14 @@ char *get_events_on_date(json_t **results_out, json_t *data, char *calendar_name
         return "date invalid (expected MMDDYY)";
     }
 
-    // Getting all events on a date is very easy thanks to our data structure
-    json_t *events_on_date = json_object_get(json_object_get(data, calendar_name), date);
-    // If calendar does not exist (i.e., has no events) or this date does not exist in the calendar (i.e., has no events), return an empty array (signifies no events)
-    if( !events_on_date ) events_on_date = json_array();
-    
+    // No need to fetch results if user doesn't want them
     if( results_out ){
+        pthread_rwlock_rdlock(&lock);
+
+        // Getting all events on a date is very easy thanks to our data structure
+        json_t *events_on_date = json_object_get(json_object_get(data, calendar_name), date);
+        // If calendar does not exist (i.e., has no events) or this date does not exist in the calendar (i.e., has no events), return an empty array (signifies no events)
+        if( !events_on_date ) events_on_date = json_array();
         // However, to account for our 'removed' field, we must filter out removed events before returning the results
         json_t *results = json_array();
         json_t *true_obj = json_true();
@@ -277,6 +287,7 @@ char *get_events_on_date(json_t **results_out, json_t *data, char *calendar_name
         json_object_set_new("events", results); // hand over reference
 
         *results_out = to_return; // caller will need to decref to free everything
+        pthread_rwlock_unlock(&lock);
     }
 
     return NULL;
@@ -301,6 +312,7 @@ char *get_events_in_range(json_t **results_out, json_t *data, char *calendar_nam
     }
 
     if( results_out ){
+        pthread_rwlock_rdlock(&lock);
         json_t *to_return = json_object();
         int num_days = 0;
         // TODO: this setup currently uses an inclusive start and exclsuive stop (as is a common paradigm) - is this ok?
@@ -319,6 +331,7 @@ char *get_events_in_range(json_t **results_out, json_t *data, char *calendar_nam
         }
         json_object_set_new(to_return, "numdays", json_integer(num_days)); // hand reference over
         *results_out = to_return; // caller will need to decref to free everything
+        pthread_rwlock_unlock(&lock);
     }
     return NULL;
 }
@@ -591,9 +604,13 @@ int main(int argc, char* argv[])
     int yes=1;
     char s[INET6_ADDRSTRLEN];
     int rv;
+    bool multithread = false;
 
     // TODO: implement multithreading, probably requiring a lock
-    if( argc > 2 || (argc == 2 && strcmp(argv[1], "-mt")) ){
+    if( argc == 2 && !strcmp(argv[1], "-mt") ){
+        multithread = true;
+    }
+    else if( argc != 1 ){
         fprintf(stderr, "[Error] Usage: %s [-mt]", argv[0]);
     }
 
@@ -672,13 +689,14 @@ int main(int argc, char* argv[])
         printf("[INFO] Accepted connection from %s\n", s);
 
         // TODO: refactor to multi-thread, not fork
-        if (!fork()) { // this is the child process
-            close(sockfd); // child doesn't need the listener
-            int rc = client_handler(new_fd);
-            close(new_fd);
-            exit(rc);
+        if( multithread ){
+            // TODO: flesh out skeleton
+            // create run_client_thread_args object, fill with args
+            pthread_create(run_client_thread, args, NULL); // do anything with return value?
         }
-        close(new_fd);  // parent doesn't need this
+        else{
+            handle_client(new_fd);
+        }
     }
 
     return 0;
@@ -689,18 +707,21 @@ json_t *get_next_request(int sockfd){
     static int space_remaining = BUFSIZ; // essentially tracks end of meaningful data in buffer
     int current_bufsiz_multiple = 1; // resets to 1 on every invocation
     do {
-        // If contains a newline, this request fits in the current buffer.
+        int space_used = current_multiple * BUFSIZ - space_remaining;
+        char *unused_buffer_start = buffer + space_used;
+        // If the valid portion of the buffer contains a newline, the next request fits in the current buffer.
         // Parse request and save reference in buffer so we can pick up from here next time (in case we received 2 full requests at once)
-        char *newline = strnchr(buffer, current_bufsiz_multiple * BUFSIZ - space_remaining, '\n');
+        char *newline = memchr(buffer, '\n', unused_buffer_start - buffer);
         if( newline ){
             // Parse JSON up to newline
-            // Parse now so we can throw out the string we parsed from: returning a string might be more general, but would require allocating space for the copied request so we can free the buffer (certainly doable but adds complexity which is uneeded here).
+            // Parse now so we can throw out the string we parsed from: returning a string might be more general, but would require allocating space for the copied request so we can free the buffer (certainly doable but adds complexity which is unneeded here).
             json_t *to_return = json_loadb(buffer, newline - buffer, 0, NULL);
 
             // Bookkeep for next time
             // Because we check after every BUFSIZ-sized chunk, we can be sure that the data beyond the newline will fit into a BUFSIZ-size buffer
-            int n_bytes_to_preserve = current_multiple * BUFSIZ - (newline - buffer) - 1; // left in buffer beyond newline: all - parsed - 1: < BUFSIZ
+            int n_bytes_to_preserve = current_multiple * BUFSIZ - (newline - buffer) - 1; // left in buffer beyond newline: all - parsed - 1 (newline): < BUFSIZ
             char *small_buffer = malloc(BUFSIZ);
+            // TODO: errcheck - abort?
             strncpy(small_buffer, newline + 1, n_bytes_to_preserve);
             free(buffer); // release space after each request: if we keep adding onto same buffer we will consume lots of memory we aren't using
             buffer = small_buffer;
@@ -711,18 +732,39 @@ json_t *get_next_request(int sockfd){
         // If buffer full, allocate more space: keep it contiguous so we can JSON parse it all together
         if( space_remaining == 0 ){
             current_bufsiz_multiple += 1;
-            buffer = realloc(current_bufsiz_multiple * BUFSIZ);
+            buffer = realloc(buffer, current_bufsiz_multiple * BUFSIZ);
+            //TODO: errcheck - abort?
         }
 
         // Receive more data to try to find end of request
-        int got = recv(sockfd, buffer + (current_bufsiz_multiple * BUFSIZ - space_remaining), space_remaining);
+        int got = recv(sockfd, unused_buffer_start, space_remaining);
         // TODO: ERRCHECK
+        if( got == 0 ){
+            // connection broken - abort? end thread?
+        }
         space_remaining -= got;
     } while(true);
 }
 
-int client_handler(int sockfd){
+void *run_client_thread(void *run_client_thread_args){
+    run_client_thread_args;
+    handle_client(args->sockfd);
+}
+
+int handle_client(int sockfd){
     // TODO: implement
+    while(true){
+        json_t *next_request = get_next_request(sockfd);
+        json_t *result = dispatch(next_request);
+        int rc = json_dumpfd(result, sockfd, JSON_COMPACT); // takes care of sending over TCP (streaming) socket
+        if( rc < 0 ){
+            // TODO: undefined behavior occurred, client probably got bad data. maybe close socket or abort server?
+        }
+
+        json_decref(next_request);
+        json_decref(result);
+    }
+    close(sockfd); // TODO: get here if no can't send/recv
     // while true:
     //  get_next_request
     //  dispatch
