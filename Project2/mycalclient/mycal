@@ -4,9 +4,13 @@ import sys
 import json
 import socket
 
-#Assign host and port
-port = 41000
-host = "" #WHAT IS IP???
+
+#Assign host and port based on config file
+configPath = "../mycalserver/.mycal"
+with open(configPath, "r") as f:
+				config=json.load(f)
+				port = int(config["port"])
+				host = config["servername"]
 
 #Creates JSON from array to be sent to server
 def create(arr):
@@ -24,19 +28,19 @@ def create(arr):
 												jsonDict[arr[i]] = arr[i+1]
 
 				elif command == "remove":
-								jsonDict["identifier"] = arr[3]
+								jsonDict["event_id"] = arr[3]
 
 				elif command == "update":
-								jsonDict["identifier"] = arr[3]
+								jsonDict["event_id"] = arr[3]
 								jsonDict["field"] = arr[4]
-								jsonDict["newValue"] = arr[5]
+								jsonDict["value"] = arr[5]
 
 				elif command == "get":
 								jsonDict["date"] = arr[3]
 
 				elif command == "getrange":
-								jsonDict["startDate"] = arr[3]
-								jsonDict["endDate"] = arr[4]
+								jsonDict["start_date"] = arr[3]
+								jsonDict["end_date"] = arr[4]
 							
 				#Bad command, return None
 				else:
@@ -53,15 +57,16 @@ def contactServer(data):
 
 				client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 				client.connect((host, port))
-				client.sendall(jsonObj)
+				client.sendall(jsonObj.encode())
 
 				#Receive json from server
 				stringData = ""
 				while True:
 								rec = client.recv(1024)
-								if not rec:
-												break
 								stringData += rec.decode()
+								#Newline indicates all data has been received
+								if "\n" in stringData:
+												break
 
 				dataDict = json.loads(stringData)
 
@@ -73,34 +78,41 @@ def contactServer(data):
 #Format/Print data returned by server
 def printData(dataDict):
 				print(f"Calendar Impacted: {dataDict['calendar']}")
-				print(f"Event Unique identifier: {dataDict['identifier']}")
+				if "identifier" in dataDict.keys():
+								print(f"Event Unique identifier: {dataDict['identifier']}")
+
 				if not dataDict["success"]:
 								print(f"Command failed for follwoing reason: {dataDict['error']}")
 								return
 
 				#Processing for different commands
 				if dataDict["command"] == "add":
-								specDict = dataDict["data"]
-								print("Added event with the following details:")
-								for key in specDict.keys():
-												print(f'{key} - {specDict[key]}')
+								print("Event successfully added")
 
 				elif dataDict["command"] == "remove":
 								print("Successfully removed event")
 
 				elif dataDict["command"] == "update":
-								specDict = dataDict["data"]
-								print("Successfully updated event. New Details:")
-								for key in specDict.keys():
-												print(f'{key} - {specDict[key]}')
+								print("Successfully updated event")
 
 				elif dataDict["command"] == "get":
 								print("List of events on requested day:")
-								print(dataDict["data"])
+								print()
+								for item in dataDict["data"]["events"]:
+												for key in item.keys():
+																print(f"{key}: {item[key]}")
+												print()
 				
 				elif dataDict["command"] == "getrange":
 								print("List of events in requested range of days:")
-								print(dataDict["data"])
+								print()
+								for date in dataDict["data"]["days"]:
+												print(f"Events on {date}:")
+												for item in dataDict["data"]["days"][date]["events"]:
+																for key in item.keys():
+																				print(f"{key}: {item[key]}")
+																print()
+												print()
 				
 
 #Invalid input
@@ -110,7 +122,6 @@ if len(sys.argv) <= 2:
 #Case for add, remove, update, get, getrange commands
 elif sys.argv[2] != "input":
 				retJSON = create(sys.argv)
-				print(retJSON)
 				if retJSON != None:
 								data = contactServer(retJSON)
 								printData(data)
@@ -133,7 +144,6 @@ elif sys.argv[2] == "input":
 																arr = arr[:6]
 												
 												retJSON = create(arr)
-												print(retJSON)
 												if retJSON != None:
 																data = contactServer(retJSON)
 																printData(data)
