@@ -23,7 +23,11 @@ mycalserver: mycalserver.o
 
 clean:
 	@echo Cleaning...
-	@rm -rf lib include
+	@rm -rf lib include data
 	@rm $(TARGETS) *.o
 
-.PHONY: all clean
+wipe:
+	@echo Wiping...
+	@rm $(TARGETS) *.o
+
+.PHONY: all clean wipe

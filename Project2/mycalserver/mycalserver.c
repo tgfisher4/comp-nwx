@@ -238,9 +238,10 @@ json_t *load_data(char *data_path){
     // I think it would make more sense to be lazier and create dir just before saving but instructions suggest this approach
     if( !data_file && errno == ENOENT ){ 
         // Parse until slash
+        // abc/def
         char *last_slash = strrchr(data_path, '/');
         char* dir_path = malloc(last_slash - data_path + 1);
-        snprintf(dir_path, last_slash - data_path, "%s", data_path); // writes a nul terminator
+        snprintf(dir_path, last_slash - data_path + 1, "%s", data_path); // writes a nul terminator
         if( mkpath(dir_path, S_IRWXU | S_IRWXO) < 0 ){
             perror("[Error] Failed to make path to data save location");
             exit(1);
@@ -291,6 +292,8 @@ void save_data(char *data_path, json_t *database, pthread_rwlock_t lock, int *ex
     fclose(data_file);
 }
 
+void save_and_exit(int exit_status){ save_data(DATA_PATH, global_database, global_database_lock, &exit_status); }
+
 void *run_client_thread(void *void_args){
     sigset_t set;
     sigemptyset(&set);
@@ -308,11 +311,23 @@ void handle_client(int sockfd, json_t *database, pthread_rwlock_t lock){
             printf("[Info] Connection with client broken.\n");
             break;
         }
-        json_t *result = dispatch(next_request, database, lock);
+        json_t *result;
+        if( json_is_string(next_request) ){ //  if it's a string, its an error message
+            result = json_object();
+            json_object_set_new(result, "success", json_false());
+            json_object_set_new(result, "error", json_copy(next_request));
+        }
+        else{
+            result = dispatch(next_request, database, lock);
+        }
         int rc = json_dumpfd(result, sockfd, JSON_COMPACT); // takes care of sending over TCP (streaming) socket
         if( rc < 0 ){
-            fprintf(stderr, "[Error] Problem sending result back to client. Aborting...\n");
-            save_data(DATA_PATH, database, lock, &rc);
+            fprintf(stderr, "[Error] Problem sending result back to client. Aborting connection...\n");
+            break;
+        }
+        if( send(sockfd, "\n", 1, 0) != 1 ){
+            fprintf(stderr, "[Error] Problem sending result back to client. Aborting connection...\n");
+            break;
         }
 
         json_decref(next_request);
@@ -328,13 +343,22 @@ json_t *get_next_request(int sockfd){
     }
     if( !buffer ){
         fprintf(stderr, "[Error] Memory allocation failed: %s. Aborting...\n", strerror(errno));
-        exit(1);
+        save_and_exit(1);
     }
     static int space_remaining = BUFSIZ; // essentially tracks end of meaningful data in buffer
+    // TODO: convert between host and network byte order?
     int current_bufsiz_multiple = 1; // resets to 1 on every invocation
     do {
         int space_used = current_bufsiz_multiple * BUFSIZ - space_remaining;
         char *unused_buffer_start = buffer + space_used;
+        /*
+        printf("[Debug] %d of %d bytes remaining in buffer\n", space_remaining, current_bufsiz_multiple * BUFSIZ);
+        char *print_buffer = malloc(space_used + 1);
+        snprintf(print_buffer, space_used + 1, "%s", buffer);
+        printf("[Debug] Start of buffer|%s|End of buffer\n", print_buffer);
+        free(print_buffer);
+        */
+
         // If the valid portion of the buffer contains a newline, the next request fits in the current buffer.
         // Parse request and save reference in buffer so we can pick up from here next time (in case we received 2 full requests at once)
         char *newline = memchr(buffer, '\n', unused_buffer_start - buffer);
@@ -342,19 +366,29 @@ json_t *get_next_request(int sockfd){
             // Parse JSON up to newline
             // Parse now so we can throw out the string we parsed from: returning a string might be more general, but would require allocating space for the copied request so we can free the buffer (certainly doable but adds complexity which is unneeded here).
             json_t *to_return = json_loadb(buffer, newline - buffer, 0, NULL);
+            if( !to_return ){
+                to_return = json_string("Invalid request: could not parse as JSON");
+            }
 
             // Bookkeep for next time
-            // Because we check after every BUFSIZ-sized chunk, we can be sure that the data beyond the newline will fit into a BUFSIZ-size buffer
-            int n_bytes_to_preserve = current_bufsiz_multiple * BUFSIZ - (newline - buffer) - 1; // left in buffer beyond newline: all - parsed - 1 (newline): < BUFSIZ
+            // Because we check after every BUFSIZ-sized chunk, we can be sure that any valid data beyond the newline will fit into a BUFSIZ-size buffer
+            int n_bytes_to_preserve = space_used - (newline - buffer) - 1; // valid data left in buffer beyond newline: valid - parsed - 1 (newline): < BUFSIZ
             char *small_buffer = malloc(BUFSIZ);
             if( !small_buffer ){
                 fprintf(stderr, "[Error] Memory allocation failed: %s. Aborting...\n", strerror(errno));
-                exit(1);
+                save_and_exit(1);
             }
             strncpy(small_buffer, newline + 1, n_bytes_to_preserve);
             free(buffer); // release space after each request: if we keep adding onto same buffer we will consume lots of memory we aren't using
             buffer = small_buffer;
             space_remaining = BUFSIZ - n_bytes_to_preserve; // everything beyond what we will preserve is free buffer space
+            /*
+            printf("[Debug] Preserving %d characters, so that there is %d space remaining in the buffer (we expect %d = %d + %d)\n", n_bytes_to_preserve, space_remaining, BUFSIZ, n_bytes_to_preserve, space_remaining);
+            char *preserved_contents = malloc(n_bytes_to_preserve + 1);
+            snprintf(preserved_contents, n_bytes_to_preserve+1, "%s", buffer);
+            printf("[Debug] Preserved buffer contents: START|%s|END\n", preserved_contents);
+            free(preserved_contents);
+            */
             return to_return;
         }
 
@@ -364,12 +398,17 @@ json_t *get_next_request(int sockfd){
             buffer = realloc(buffer, current_bufsiz_multiple * BUFSIZ);
             if( !buffer ){
                 fprintf(stderr, "[Error] Memory allocation failed: %s. Aborting...\n", strerror(errno));
-                exit(1);
+                save_and_exit(1);
             }
+            space_remaining = BUFSIZ;
         }
 
         // Receive more data to try to find end of request
         int got = recv(sockfd, unused_buffer_start, space_remaining, 0);
+        if( got < 0 ){
+            perror("[Error] Could not receive from client");
+            return NULL;
+        }
         if( got == 0 ){
             return NULL;
         }
@@ -387,7 +426,7 @@ json_t *dispatch(json_t *request, json_t *database, pthread_rwlock_t lock){
         json_object_set_new(result, "identifier", json_string("XXXX"));
         return result;
     }
-    json_object_set(result, "command", json_object_get(request, "command")); // points to same command json_string as request.command
+    json_object_set_new(result, "command", json_copy(json_object_get(request, "command"))); // creates a new reference so we don't have to spend 2 extra lines first fetching and then increffing request.command
 
     const char *calendar_name;
     if( !(calendar_name = json_string_value(json_object_get(request, "calendar"))) ){
@@ -397,7 +436,7 @@ json_t *dispatch(json_t *request, json_t *database, pthread_rwlock_t lock){
         json_object_set_new(result, "identifier", json_string("XXXX"));
         return result;
     }
-    json_object_set(result, "calendar", json_object_get(request, "calendar")); // points to same command json_string as request.calendar
+    json_object_set_new(result, "calendar", json_copy(json_object_get(request, "calendar"))); // creates a new reference so we don't have to spend 2 extra lines first fetching and then increffing request.calendar
 
     if( !strcmp(command, "add") ){
         const char *calendar_name, *date, *time, *duration_min, *name, *description = NULL, *location = NULL;
@@ -436,6 +475,8 @@ json_t *dispatch(json_t *request, json_t *database, pthread_rwlock_t lock){
         }
         else {
             json_object_set_new(result, "identifier", json_string(added_event_id));
+            // Inspecting the jansson source, json_string makes a copy of the string input, so it is safe to free this here
+            free(added_event_id);
         }
         return result;
     }
@@ -613,8 +654,8 @@ bool validate_time(const char *time, int *hour_out, int *minute_out){
     int hour = atoi(hour_str);
     int minute = atoi(minute_str);
 
-    if( hour <= 0 || hour > 23 ) return false;
-    if( minute <= 0 || minute > 59 ) return false;
+    if( hour < 0 || hour > 23 ) return false;
+    if( minute < 0 || minute > 59 ) return false;
 
     if( hour_out ) *hour_out = hour;
     if( minute_out ) *minute_out = minute;
@@ -623,7 +664,7 @@ bool validate_time(const char *time, int *hour_out, int *minute_out){
 
 bool str_to_int(const char *str, int *int_out){
     char *end_of_int;
-    int res = strtol(str, &end_of_int, 0);
+    int res = strtol(str, &end_of_int, 10);
     if( end_of_int != str + strlen(str) ){
         return false;
     }
@@ -681,7 +722,7 @@ char *add_event(char **event_id_out, json_t *database, pthread_rwlock_t lock, co
     // Create a new event and add the expected fields
     json_t *new_event = json_object();
     json_object_set_new(new_event, "time", json_string(time));
-    json_object_set_new(new_event, "duration_min", json_string(duration_min));
+    json_object_set_new(new_event, "duration", json_string(duration_min));
     json_object_set_new(new_event, "name", json_string(name));
     json_object_set_new(new_event, "description", description ? json_string(description): json_null());
     json_object_set_new(new_event, "location", location ? json_string(location): json_null());
@@ -692,7 +733,9 @@ char *add_event(char **event_id_out, json_t *database, pthread_rwlock_t lock, co
 
     if( event_id_out ){
         // Construct event id from date and id_on_date
-        char *event_id = malloc(6 + ceil(log10(id_on_date)) + 1); // 6 = len(MMDDYY), 1 = len("\0")
+        // TODO: this event_id will be embedded in a json_t which will later be decref'd: does that free this string? If not, does it copy so that we can free this after returning?
+        int id_len = id_on_date > 0 ? ceil(log10(id_on_date)) : 1;
+        char *event_id = malloc(6 + 1 + id_len + 1); // 6 = len(MMDDYY), 1 = len(":"), 1 = len("\0")
         sprintf(event_id, "%s:%d", date, id_on_date);
 
         *event_id_out = event_id;
@@ -708,14 +751,12 @@ char *remove_event(json_t *database, pthread_rwlock_t lock, const char *calendar
     parse_event_id(event_id, date, &id_on_date);
 
     pthread_rwlock_wrlock(&lock);
-    int rc = json_object_set_new(
-        json_array_get(
-            json_object_get(json_object_get(database, calendar_name), date),
-            id_on_date
-        ),
-        "removed",
-        json_true()
+    json_t *event = json_array_get(
+        json_object_get(json_object_get(database, calendar_name), date),
+        id_on_date
     );
+    json_object_del(event, "removed"); // decref's the bool ref to manage memory
+    int rc = json_object_set_new(event, "removed", json_true());
     pthread_rwlock_unlock(&lock);
 
     if( rc < 0 ) return "No such event exists on this calendar";
@@ -750,14 +791,12 @@ char *update_event(json_t *database, pthread_rwlock_t lock, const char *calendar
 
     /*** Perform update ***/
     pthread_rwlock_wrlock(&lock);
-    int rc = json_object_set_new(
-        json_array_get(
-            json_object_get(json_object_get(database, calendar_name), date),
-            id_on_date
-        ),
-        field,
-        json_string(value)
+    json_t *event = json_array_get(
+        json_object_get(json_object_get(database, calendar_name), date),
+        id_on_date
     );
+    json_object_del(event, field); // decref count of the previous value. May fail if field is optional and was not set previously
+    int rc = json_object_set_new(event, field, json_string(value));
     pthread_rwlock_unlock(&lock);
     if( rc < 0 ) return "No such event exists on this calendar";
     return NULL;
@@ -778,15 +817,25 @@ char *get_events_on_date(json_t **results_out, json_t *database, pthread_rwlock_
     // If calendar does not exist (i.e., has no events) or this date does not exist in the calendar (i.e., has no events), return an empty array (signifies no events)
     if( !events_on_date ) events_on_date = json_array();
     // However, to account for our 'removed' field, we must filter out removed events before returning the results
-    json_t *results = json_array();
-    json_t *true_obj = json_true();
-    int index; json_t *value;
-    json_array_foreach(events_on_date, index, value){
-        if( !json_equal(json_object_get(value, "removed"), true_obj) ){
-            json_array_append(results, value);
+    json_t *results;
+    if( json_array_size(events_on_date) ){
+        results = json_array();
+        json_t *true_obj = json_true();
+        int index; json_t *value;
+        json_array_foreach(events_on_date, index, value){
+            if( !json_equal(json_object_get(value, "removed"), true_obj) ){
+                json_t *event_to_append = json_deep_copy(value);
+                json_object_del(event_to_append, "removed");
+                json_array_append_new(results, event_to_append);
+            }
         }
+        json_decref(true_obj);
     }
-    json_decref(true_obj);
+    else{
+        // in the case that the event list is empty, we created a new array which we want to embed in the result so that it is decref'd and freed later.
+        results = events_on_date;
+    }
+    pthread_rwlock_unlock(&lock);
 
     // Wrap in an object to tack on numevents field
     json_t *to_return = json_object();
@@ -794,7 +843,6 @@ char *get_events_on_date(json_t **results_out, json_t *database, pthread_rwlock_
     json_object_set_new(to_return, "events", results); // hand over reference
 
     *results_out = to_return; // caller will need to decref to free everything
-    pthread_rwlock_unlock(&lock);
 
     return NULL;
 }
@@ -821,15 +869,21 @@ char *get_events_in_range(json_t **results_out, json_t *database, pthread_rwlock
     if( !results_out ) return NULL;
 
     // No locking because we just call get_events_on_date which does it for us
-    json_t *to_return = json_object();
+    json_t *date_to_events = json_object();
     int num_days = 0;
     // TODO: this setup currently uses an inclusive start and exclsuive stop (as is a common paradigm) - is this ok?
     for(; !(day == end_day && month == end_month && year == end_year); num_days++ ){
         char date[7];
-        sprintf(date, "%2d%2d%2d", day, month, year);
+        sprintf(date, "%02d%02d%02d", month, day, year);
         json_t *events_today;
         get_events_on_date(&events_today, database, lock, calendar_name, date);
-        json_object_set_new(to_return, date, events_today); // hand reference to to_return
+        json_object_set_new(date_to_events, date, events_today); // hand reference to to_return
+        /*
+        char *events_today_json = json_dumps(events_today, 0);
+        if( !events_today_json ) printf("there was an error printing events_today...\n");
+        printf("setting key %s to %s\n", date, events_today_json);
+        free(events_today_json);
+        */
 
         // Advance to next day, ignoring leap years
         day = (day % MONTH_TO_N_DAYS[month]) + 1;
@@ -838,7 +892,10 @@ char *get_events_in_range(json_t **results_out, json_t *database, pthread_rwlock
         bool is_new_year = is_new_month && month == 1;
         if( is_new_year ) year = (year % 99) + 1; 
     }
+
+    json_t *to_return = json_object();
     json_object_set_new(to_return, "numdays", json_integer(num_days)); // hand reference over
+    json_object_set_new(to_return, "days", date_to_events); // hand reference over
     *results_out = to_return; // caller will need to decref to free everything
 
     return NULL;
