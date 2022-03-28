@@ -6,144 +6,158 @@ import socket
 
 
 #Assign host and port based on config file
-configPath = "../mycalserver/.mycal"
+configPath = ".mycal"
 with open(configPath, "r") as f:
-				config=json.load(f)
-				port = int(config["port"])
-				host = config["servername"]
+    config=json.load(f)
+    port = int(config["port"])
+    host = config["servername"]
+
+helpMessage = '\n'.join([
+    f"Usage: {sys.argv[0]} <calendar name> <command> <arguments>",
+    "Supported commands and arguments:",
+    "   - add date <date of event in format MMDDYY> time <time of event in 24-hour format HHMM> duration <number of minutes event will last> name <name of event> [description <event description>] [location <event location>] :: adds an event to the calendar and reports its id",
+    "   - update <event id> <any field from add> <value to update to> :: updates a field on an event on the calendar",
+    "   - remove <event id> :: removed an event from the calenar",
+    "   - get <date> :: displays all events on the calendar on a specific day",
+    "   - getrange <start date> <end date> :: displays all events on the calendar in a range of dates - note that the start date is inclusive and the end date is exclusive",
+    "   - input <filename> :: executes a series of commands, stored in a json file, on this calendar"
+])
+
 
 #Creates JSON from array to be sent to server
 def create(arr):
-				jsonDict = {}
+    jsonDict = {}
 
-				calName = sys.argv[1]
-				jsonDict["calendar"] = calName
+    calName = sys.argv[1]
+    jsonDict["calendar"] = calName
 
-				command = arr[2]
-				jsonDict["command"] = command
+    command = arr[2]
+    jsonDict["command"] = command
 
-				#Different cases for each command
-				if command == "add":
-								for i in range(3, len(arr), 2):
-												jsonDict[arr[i]] = arr[i+1]
+    #Different cases for each command
+    if command == "add":
+        for i in range(3, len(arr), 2):
+            jsonDict[arr[i]] = arr[i+1]
 
-				elif command == "remove":
-								jsonDict["event_id"] = arr[3]
+    elif command == "remove":
+        jsonDict["event_id"] = arr[3]
 
-				elif command == "update":
-								jsonDict["event_id"] = arr[3]
-								jsonDict["field"] = arr[4]
-								jsonDict["value"] = arr[5]
+    elif command == "update":
+        jsonDict["event_id"] = arr[3]
+        jsonDict["field"] = arr[4]
+        jsonDict["value"] = arr[5]
 
-				elif command == "get":
-								jsonDict["date"] = arr[3]
+    elif command == "get":
+        jsonDict["date"] = arr[3]
 
-				elif command == "getrange":
-								jsonDict["start_date"] = arr[3]
-								jsonDict["end_date"] = arr[4]
-							
-				#Bad command, return None
-				else:
-								print("Error: Unknown Command")
-								return None
-					
-				#Retrun dictionary to be sent to server
-				return jsonDict
+    elif command == "getrange":
+        jsonDict["start_date"] = arr[3]
+        jsonDict["end_date"] = arr[4]
+                
+    #Bad command, return None
+    else:
+        print("Error: Unknown Command")
+        print(helpMessage)
+        return None
+        
+    #Retrun dictionary to be sent to server
+    return jsonDict
 
 
 #Sends data to server using socket and returns what was received
 def contactServer(data):
-				jsonObj = json.dumps(data) + "\n"
+    jsonObj = json.dumps(data) + "\n"
 
-				client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-				client.connect((host, port))
-				client.sendall(jsonObj.encode())
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    client.connect((host, port))
+    client.sendall(jsonObj.encode())
 
-				#Receive json from server
-				stringData = ""
-				while True:
-								rec = client.recv(1024)
-								stringData += rec.decode()
-								#Newline indicates all data has been received
-								if "\n" in stringData:
-												break
+    #Receive json from server
+    stringData = ""
+    while True:
+        rec = client.recv(1024)
+        stringData += rec.decode()
+        #Newline indicates all data has been received
+        if "\n" in stringData:
+            break
 
-				dataDict = json.loads(stringData)
+    dataDict = json.loads(stringData)
 
-				client.close()
+    client.close()
 
-				#Return json (dictionary) of data sent by server
-				return dataDict
+    #Return json (dictionary) of data sent by server
+    return dataDict
 
 #Format/Print data returned by server
 def printData(dataDict):
-				print(f"Calendar Impacted: {dataDict['calendar']}")
-				if "identifier" in dataDict.keys():
-								print(f"Event Unique identifier: {dataDict['identifier']}")
+    print(f"Calendar Impacted: {dataDict['calendar']}")
+    if "identifier" in dataDict.keys():
+        print(f"Event Unique identifier: {dataDict['identifier']}")
 
-				if not dataDict["success"]:
-								print(f"Command failed for follwoing reason: {dataDict['error']}")
-								return
+    if not dataDict["success"]:
+        print(f"Command failed for following reason: {dataDict['error']}")
+        return
 
-				#Processing for different commands
-				if dataDict["command"] == "add":
-								print("Event successfully added")
+    #Processing for different commands
+    if dataDict["command"] == "add":
+        print("Event successfully added")
 
-				elif dataDict["command"] == "remove":
-								print("Successfully removed event")
+    elif dataDict["command"] == "remove":
+        print("Successfully removed event")
 
-				elif dataDict["command"] == "update":
-								print("Successfully updated event")
+    elif dataDict["command"] == "update":
+        print("Successfully updated event")
 
-				elif dataDict["command"] == "get":
-								print("List of events on requested day:")
-								print()
-								for item in dataDict["data"]["events"]:
-												for key in item.keys():
-																print(f"{key}: {item[key]}")
-												print()
-				
-				elif dataDict["command"] == "getrange":
-								print("List of events in requested range of days:")
-								print()
-								for date in dataDict["data"]["days"]:
-												print(f"Events on {date}:")
-												for item in dataDict["data"]["days"][date]["events"]:
-																for key in item.keys():
-																				print(f"{key}: {item[key]}")
-																print()
-												print()
-				
+    elif dataDict["command"] == "get":
+        print("List of events on requested day:")
+        print()
+        for item in dataDict["data"]["events"]:
+            for key in item.keys():
+                print(f"{key}: {item[key]}")
+            print()
+    
+    elif dataDict["command"] == "getrange":
+        print("List of events in requested range of days:")
+        print()
+        for date in dataDict["data"]["days"]:
+            print(f"Events on {date}:")
+            for item in dataDict["data"]["days"][date]["events"]:
+                for key in item.keys():
+                                print(f"{key}: {item[key]}")
+                print()
+            print()
+
 
 #Invalid input
 if len(sys.argv) <= 2:
-				print("Error: Not enough arguments")
+    print("Error: Not enough arguments")
+    print(helpMessage)
 
 #Case for add, remove, update, get, getrange commands
 elif sys.argv[2] != "input":
-				retJSON = create(sys.argv)
-				if retJSON != None:
-								data = contactServer(retJSON)
-								printData(data)
+    retJSON = create(sys.argv)
+    if retJSON != None:
+        data = contactServer(retJSON)
+        printData(data)
 
 #Case for preloaded JSON file
 #JSON file takes form {"commands" : ["add ...", "remove ...", "update...", "getrange...", ...]
 elif sys.argv[2] == "input":
-				fileName = sys.argv[3]
-				with open(fileName, 'r') as f:
-								data = json.load(f)
-								for item in data["commands"]:
-												#adds filler to replace ./mycal and adds calendar name to string
-												item = "- " + sys.argv[1] + " " + item
-												#makes array out of string
-												arr = item.split()
+    fileName = sys.argv[3]
+    with open(fileName, 'r') as f:
+        data = json.load(f)
+        for item in data["commands"]:
+            #adds filler to replace ./mycal and adds calendar name to string
+            item = "- " + sys.argv[1] + " " + item
+            #makes array out of string
+            arr = item.split()
 
-												#Fixes case where a field has a space in it (Ex: "Debartolo 317")
-												if arr[2] == "update" and len(arr) > 6:
-																arr[5] = " ".join(arr[5:])[1:-1]
-																arr = arr[:6]
-												
-												retJSON = create(arr)
-												if retJSON != None:
-																data = contactServer(retJSON)
-																printData(data)
+            #Fixes case where a field has a space in it (Ex: "Debartolo 317")
+            if arr[2] == "update" and len(arr) > 6:
+                arr[5] = " ".join(arr[5:])[1:-1]
+                arr = arr[:6]
+            
+            retJSON = create(arr)
+            if retJSON != None:
+                data = contactServer(retJSON)
+                printData(data)
