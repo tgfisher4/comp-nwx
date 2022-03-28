@@ -2,4 +2,10 @@ Project 2
 
 Names: Tommy Gallagher, Graham Fisher, Jason Brown
 
-To invoke the code, you need to run "make" in the mycalserver directory and then run the command "./mycalserver". This allows the server to run. Then you can run the client by calling ./mycal and inputting commands. The server is set to run as default on student04.cse.nd.edu.
+To compile the code, run `make` in the `Project2` directory.
+
+To run the server, run `cd mycalserver && ./mycalserver` (from the `Project2` directory).
+
+To run the client, execute `cd mycalclient && ./mycal <command>` (from the `Project2` directory).
+
+The server/client are configured by default to run with the server on `student04.cse.nd.edu:41000`.
