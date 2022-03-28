@@ -1,3 +1,5 @@
+# Group: Graham Fisher, Tommy Gallagher, Jason Brown
+
 CC= 		gcc
 CFLAGS=		-g -Wall -std=gnu99 -Iinclude
 LD=			gcc

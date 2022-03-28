@@ -1,5 +1,5 @@
 /*
-** server.c -- a stream socket server demo
+Group: Graham Fisher, Tommy Gallagher, Jason Brown
 */
 
 #include <stdio.h>

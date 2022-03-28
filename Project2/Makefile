@@ -1,3 +1,4 @@
+# Group: Graham Fisher, Tommy Gallagher, Jason Brown
 TARGETS= mycalclient/mycal mycalserver/mycalserver
 
 all: $(TARGETS)
