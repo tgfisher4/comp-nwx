@@ -365,6 +365,19 @@ void *handle_socket_thread_wrapper(void *arg){
 void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){ // data is global so it can be manipulated by all (could also accept a pointer to it)
     while(true){
         json_t *request = get_next_request(sockfd);
+        
+        // NOTE: after some thought, select/poll makes way more sense for this project
+        // Consider the following scenario in a 2-player game
+        //  1) Player 1 submits guess: p1 thread processes it without issue.
+        //  2) Player 2 submits guess: p2 locks, records guess in global, unlocks
+        //  3) Player 1 submits unsolicited guess (assuming the worst): suppose p1 thread then grabs the lock (BEFORE p2 can grab it to run start_next_round), sees p1 and p2 have same number of guesses, assesses p1's guess against the WRONG reference word - the next word to be chosen by start_next_round may have a different number of letters.
+        // This and other cases (involving when to evaluate whether a round is over, when to evaluate the next guess number) show that, in general, my critical sections are pretty much the ENTIRE processing of a response: perhaps I could use more complex global variables with my lock to try to keep threads from interfering with one another, but the goal of this work would pretty much be to serialize 'Guess' messages.
+        // But then, when some functions are expecting the caller to hold the lock and some are not, things get messier.
+        // At the very least, it is simplest to serialize ALL messages, and with very small games such as these this should not incur any measurable performance penalty
+        // Of course, the best way to do this would be to use select/poll, where all requests are serialized and processed in order (no concurrency).
+        // Since I already started pretty far down the thread route, this implementation will use the global lock to essentially re-implement select/poll since refactoring is not feasible.
+        //pthread_mutex_lock(&global_lock);
+
         if( !request ){
             printf("[Info] Connection with client (via socket %d) broken: unable to recv.\n", sockfd);
             break;
@@ -406,6 +419,7 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
             }
             broadcast_message_destroy(msg);
         }
+        // Is this a suitable place to unlock?
         pthread_mutex_unlock(&global_lock);
         free(broadcast_messages);
         json_decref(request);
@@ -730,7 +744,8 @@ void game_accept_handler(int sockfd){
 //  - might be desirable if more, similarly structured handlers were expected, but they are not
 jsont_t *game_message_handler(json_t *message, int sockfd, struct broadcast_message ***broadcasts){
     char *err = NULL;
-    *broadcasts = malloc(sizeof struct *broadcast_message);
+    // Default to no broadcasts
+    *broadcasts = malloc(sizeof(struct *broadcast_message));
     **broadcasts = NULL;
 
     json_t *response = json_object();
@@ -738,17 +753,21 @@ jsont_t *game_message_handler(json_t *message, int sockfd, struct broadcast_mess
 
     const char *message_type = json_string_value(json_object_get(message, "MessageType"));
     if( !message_type ){
-        err = "Required string field 'MessageType' is missing or is not a string";
+        err = "Required string field '.MessageType' is missing or is not a string";
         goto return_error;
     }
     json_t *message_data = json_get(message, "Data");
     if( !message_data ){
-        err = "Required field 'Data' is missing";
+        err = "Required field '.Data' is missing";
         goto return_error;
     }
 
     // TODO: review of locking, is it needed more places here? and what if the handlers were designed to already be locked in state before calling?
     
+
+    // Looping variables everyone in this function can use
+    const char *player;
+    json_t *info, *tmp;
 
     if( !strcmp(message_type, "Chat") ){
         json_object_set_new(response, "MessageType", json_string("ChatResult"));
@@ -786,7 +805,6 @@ jsont_t *game_message_handler(json_t *message, int sockfd, struct broadcast_mess
         json_object_set_new(response, "MessageType", json_string("JoinInstanceResult"));
         json_object_set_new(json_object_get(response, "Data"), "Result", json_string("No"));
 
-        // TODO: handle double (redundant) joininstance
         const char *player_name = json_string_value(json_object_get(message_data, "Name"));
         if( !player_name ){
             err = "Expected string field '.Data.Name' is missing or is not a string";
@@ -815,6 +833,7 @@ jsont_t *game_message_handler(json_t *message, int sockfd, struct broadcast_mess
         // Construct StartGame broadcast
         json_t *start_game_message = json_object();
         json_object_set_new(start_game_message, "MessageType", json_string("StartGame"));
+
         json_t *start_game_message_data = json_object(); 
         json_object_set_new(start_game_message_data, "Rounds", json_integer(N_ROUNDS));
         json_t *player_info = json_array();
@@ -831,47 +850,21 @@ jsont_t *game_message_handler(json_t *message, int sockfd, struct broadcast_mess
         struct broadcast_message *start_game_broadcast = broadcast_message_create(start_game_message, NULL);
         
         // Construct StartRound broadcast
-        start_round(); // TODO: implement - tells us at least the next word - I assume current word will need to be stored in global so all threads can access
-        json_t *start_round_message = json_object();
-        json_object_set_new(start_round_message, "MessageType", json_string("StartRound"));
-        json_t *start_round_message_data = json_object(); 
-        json_object_set_new(start_round_message_data, "Round", // TODO: where to store current round
-        json_object_set_new(start_round_message_data, "RoundsRemaining", // equal to N_ROUNDS - current_round + 1
-        json_object_set_new(start_round_message_data, "WordLength", json_integer(strlen(current_word)));
-        json_t *player_info = json_array();
-        json_object_foreach(player_to_info, player, info){
-            json_t *info_to_append = json_object();
-            // Don't steal references, share them
-            json_object_set(info_to_append, "Name", json_object_get(info, "Name"));
-            json_object_set(info_to_append, "Number", json_object_get(info, "Number"));
-            json_object_set(info_to_append, "Score", json_object_get(info, "Score"));// TODO: implement scoring
-            json_array_append_new(player_info, info_to_append);
-        }
-        json_object_set_new(start_round_message_data, "PlayerInfo", player_info);
-        json_object_set_new(start_round_message, "Data", start_round_message_data);
-
-        struct broadcast_message *start_round_broadcast = broadcast_message_create(start_round_message, NULL);
+        start_next_round(); // TODO: move inside handle_join_instance
+        struct broadcast_message *start_round_broadcast = compile_start_round_broadcast(); //broadcast_message_create(start_round_message, NULL);
         
         // Construct PromptForGuess broadcast
-        json_t *prompt_for_guess_message = json_object();
-        json_object_set_new(prompt_for_guess_message, "MessageType", json_string("PromptForGuess"));
-        json_t *prompt_for_guess_message_data = json_object(); 
-        json_object_set_new(prompt_for_guess_message_data, "WordLength", json_integer(strlen(current_word)));
-        // When we are prompting for a guess, we expect that everyone has submitted the last round of guessing, so everything has the same length GuessHistory
-        json_object_set_new(prompt_for_guess_message_data, "GuessNumber", json_integer(json_array_size(json_object_get(
-            json_object_iter_value(json_object_iter(player_to_info)),
-            "GuessHistory"
-        )));
-        json_object_set_new(prompt_for_guess_message_data, "Name", json_null());
-        json_object_set_new(prompt_for_guess_message, "Data", prompt_for_guess_message_data);
-        struct broadcast_message *prompt_for_guess_broadcast = broadcast_message_create(prompt_for_guess_message, dynamic_field_create("Name", resolve_name), NULL);
+        // TODO: assess need for lock in compile_prompt_for_guess since it is based on 
+        // TODO: need lock around compile_prompt_for_guess because don't want players
+        //  TODO: assess options: include one lock around all processing (truly select/poll) or include guess number in round_info global, to be updated whenever sending promptforguess
+        struct broadcast_message *prompt_for_guess_broadcast = compile_prompt_for_guess_broadcast(int guess_set_num);
 
         // Link together into broadcasts
         free(*broadcasts); // free placeholder
         *broadcasts = malloc(4 * sizeof(struct broadcast_message *));
-        (*broadcasts)[0] = start_game_bcast;
-        (*broadcasts)[1] = start_round_bcast;
-        (*broadcasts)[2] = prompt_for_guess_bcast;
+        (*broadcasts)[0] = start_game_broadcast;
+        (*broadcasts)[1] = start_round_broadcast;
+        (*broadcasts)[2] = prompt_for_guess_broadcast;
         (*broadcasts)[3] = NULL; // null-terminate the array
         
         return response;
@@ -999,12 +992,21 @@ jsont_t *game_message_handler(json_t *message, int sockfd, struct broadcast_mess
 
             struct broadcast_message *end_game_broadcast = broadcast_message_create(end_game_message, NULL);
             (*broadcasts)[2] = end_game_broadcast;
-            // TODO: how to tell server to die after sending this bcast?
+            // TODO: how to tell server to die after sending this bcast? perhaps when is_lobby is off, socket loop can check if we broadcast endgame or abortgame message
         }
 
         return response;
 
     }
+    else {
+        err = "Unrecognized MessageType. Must be one of: 'Join', 'Chat'";
+        json_object_set_new(response, "MessageType", json_string("InvalidRequest"));
+        goto return_error;
+    }
+        return_error: /* LABEL */
+    // TODO: Note in readme that we will include an '.Error' field in our 'Response' message detailing the error encountered if one occurs during processing
+    json_object_set_new(response, "Error", json_string(err));
+    return response;
     // if ladder on MessageType
     // if JoinInstance
     //   individual response = name and nonce check out ? accept : reject (JoinInstanceResponse)
@@ -1021,7 +1023,6 @@ jsont_t *game_message_handler(json_t *message, int sockfd, struct broadcast_mess
 }
 
 char *handle_join_instance(char *player_name, int nonce, int sockfd, bool *start_game_out){
-    // Need to lock so one person is definitively last to join the instance
     static int next_player_number = 0;
 
     json_t *info = json_object_get(player_to_info, player_name));
@@ -1031,9 +1032,16 @@ char *handle_join_instance(char *player_name, int nonce, int sockfd, bool *start
     if( json_integer_value(json_object_get(info, "Nonce")) != nonce ){
         return "Authentication failed: incorrect nonce";
     }
+
+    // Need to lock so one person is definitively last to join the instance
+    // Lock here (before this check) in case someone else is joining as this player from another client, but has not yet modified Diconnected@
     pthread_mutex_lock(&global_lock);
+    // TODO: if joined player now joining from a different socket, should we swap to expect messages from this connection instead? (seems reasonable
+    if( json_object_get(info, "Disconnected@") == json_null() ){ // json_null is primitive: no mem leak and comparison works
+        return "You've already joined this instance";
+    }
     json_object_set_new(info, "Sockfd", json_integer(sockfd));
-    // TODO: implement sophisticated disconnect system
+    // TODO: extension: implement sophisticated disconnect system
     //  - set disconnected@ in transition_to_game
     //  - in game server's main accept loop, wait minimum of 60 - (current time - player[disconnected@])
     //  - if we get timeout then, abandon game
@@ -1043,8 +1051,20 @@ char *handle_join_instance(char *player_name, int nonce, int sockfd, bool *start
     //      - this seems to require that we remember entire history for the round, and include it in promptforguess (or we can have another informative message)
     //  - need similar system for individual clt thds? or should we let chat/gibberish reqs keep the cxn alive?
     json_object_set_new(info, "Disconnected@", json_null());
-    json_object_set_new(info, "Number", json_integer(next_player_number++));
+    
+    // If a player is reconnecting, do not reset their round guess history
+    if( !json_object_get(info, "RoundGuessHistory") ){
+        json_object_set_new(info, "RoundGuessHistory", json_array());
+    }
+    // If player is reconnecting, reuse their previously assigned number
+    if( !json_object_get(info, "Number") ){
+        json_object_set_new(info, "Number", json_integer(next_player_number++));
+    }
 
+    // TODO: if reconnecting, need some way to check to not trigger start_game_broadcasts to everyone?
+    // - would be interesting if I could send the stat game broadcast sequence to JUST the reconnecting player
+    // - might require the broadcast becoming a multicast (be able to specify recipients)
+    // - otherwise, could detect a reconnect and send a special message containing all info needed to catch up (round number, word length, your guess history, all players' results history, guess number)
     *start_game_out = true;
     json_object_foreach(player_to_info, player, info){
         if( !json_equal(json_object_get(info, "Disconnected@"), json_null()) ){ // as a singleton, json_null does not need to be decref'd and thus there is no leak here
@@ -1074,7 +1094,7 @@ char *handle_guess(char *player_name, char *guess, int sockfd, int *rc){
     json_object_foreach(player_to_info, player, info){
         // It is possible you'll get one guess ahead of another player, but if you're already ahead you shouldn't be able to record another guess
         if( json_array_size(json_object_get(info, "RoundGuessHistory")) < n_player_guesses )
-            return "You've already submitted you guess. Please wait for other players to submit their next guess. You will be notified when all players have submitted.";
+            return "You've already submitted your guess. Please wait for other players to submit their guess. You will be notified when all players have submitted and you may submit your next guess.";
         // You are the last guess of this collective attempt if everyone has more guesses than you: one equality is a witness you are not
         if( json_array_size(json_object_get(info, "RoundGuessHistory")) == n_player_guesses )
             all_guesses_in = false;
@@ -1139,26 +1159,62 @@ char *verify_guess(char *guess){
 
 // TODO: ensure consistent capitalization for keys of info of player_to_info
 
-score_round
+// Crude scoring function that gives a player 1 point if they got the word right, and 0 otherwise
+int score_round(json_t *round_guess_history){
+    return json_equals(
+        json_array_get(round_guess_history, json_array_size(round_guess_history) - 1),
+        json_object_get(round_info, "Word")
+    );
+}
 
-// Assumes caller has locked
-void next_round(){
-    ++current_round;
+// We have determined that no locking is necessary in this function.
+//  - when starting game, locking not needed: locking in handle_join_instance ensures only one player can think they are last to join and initiate start game procedure.
+//  - when ending round, locking not needed: locking in handle_guess ensures only one player can think they are last to guess and initiate end guess set procedure, and perhaps end round and end game procedures, too.
+//  - nowhere else do we modify score, and we only read it when sending end game message to all, which will only be called from the same thread, after start_next_round is complete
+//  - this is to say: this function can only be being executed
+//  thought xpr: last player submission received, then ALL players submit in the background, start this fxn, cxt swt and process each player's guess, find that someone is last, and then enter here from another thread
+
+// NOTE: after some thought, select/poll makes way more sense for this project
+// Consider the following scenario in a 2-player game
+//  1) Player 1 submits guess: p1 thread processes it without issue.
+//  2) Player 2 submits guess: p2 locks, records guess in global, unlocks
+//  3) Player 1 submits unsolicited guess (assuming the worst): suppose p1 thread then grabs the lock (BEFORE p2 can grab it to run start_next_round), sees p1 and p2 have same number of guesses, assesses p1's guess against the WRONG reference word - the next word to be chosen by start_next_round may have a different number of letters.
+// This and other cases (involving when to evaluate whether a round is over) show that, in general, my critical sections are pretty much the ENTIRE processing of a response.
+// So, what would make the MOST sense is to use select/poll where requests are serialized so that they do not interfere with each other in this way.
+// This implementation will essentially be re-implementing select/poll in a hackish way since due to time constraints we cannot refactor into a select/poll method.
+void start_next_round(){
     json_object_foreach(player_to_info, player, info){
         int current_score = json_integer_value(json_object_get(info, "Score"));
         int round_score = score_round(current_word, json_object_get(info, "RoundGuessHistory"));
         json_object_set_new(info, "Score", json_integer(current_score + round_score));
         json_array_clear(json_object_get(info, "RoundGuessHistory"));
     }
-   current_word = select_word();
+    char *next_word = select_word();
+    json_object_set_new(round_info, "Word", json_string(next_word));
+    free(next_word);
+    json_object_set_new(round_info, "RoundNumber", json_integer(json_object_get(round_info, "RoundNumber") + 1)); // NOTE: if RoundNumber not yet set, json_integer will return 0, and thus we will start at round 1: perfect!
 }
 
 char *select_word(){
-    // TODO
+    size_t lineno = 0;
+     // Max length: 10 chars + newline + null terminator
+     // Note: We've already validated that DICT_FILE is a valid dictionary file, i.e., every word is at most 10 chars
+    char selected[12];
+    char current[12];
+    selected[0] = '\0'; /* Don't crash if file is empty */
+
+    fseek(DICT_FILE, 0, SEEK_SET);
+    while( fgets(current, sizeof(current), DICT_FILE) ){
+        if( drand48() < 1.0 / ++lineno ){
+            strcpy(selected, current);
+        }
+    }
+    size_t selectlen = strlen(selected);
+    if( selectlen > 0 && selected[selectlen-1] == '\n' ){
+        selected[selectlen-1] = '\0';
+    }
+    return strdup(selected); // TODO: free afterward
 }
-
-
-
 
 const char *get_game_winner(){
     char *curr_arg_max = NULL;
@@ -1170,16 +1226,53 @@ const char *get_game_winner(){
     return curr_arg_max;
 }
 
-struct *broadcast_message create_start_round_broadcast(char *word){
+// TODO: global round_info containing word, roundnumber
 
+struct *broadcast_message compile_start_round_broadcast(){
+    json_t *start_round_message = json_object();
+    json_object_set_new(start_round_message, "MessageType", json_string("StartRound"));
+    json_t *start_round_message_data = json_object(); 
+    json_object_set(start_round_message_data, "Round", json_object_get(round_info, "RoundNumber"));
+    json_object_set_new(start_round_message_data, "RoundsRemaining", json_integer(N_ROUNDS - json_object_get(round_info, "RoundNumber") + 1)); // equal to N_ROUNDS - current_round + 1
+    json_object_set_new(start_round_message_data, "WordLength", json_integer(strlen(json_string_value(json_object_get(round_info, "Word")))));
+    json_t *player_info = json_array();
+    json_object_foreach(player_to_info, player, info){
+        json_t *info_to_append = json_object();
+        // Don't steal references, share them
+        json_object_set(info_to_append, "Name", json_object_get(info, "Name"));
+        json_object_set(info_to_append, "Number", json_object_get(info, "Number"));
+        json_object_set(info_to_append, "Score", json_object_get(info, "Score"));
+        json_array_append_new(player_info, info_to_append);
+    }
+    json_object_set_new(start_round_message_data, "PlayerInfo", player_info);
+    json_object_set_new(start_round_message, "Data", start_round_message_data);
+
+    struct broadcast_message *start_round_broadcast = broadcast_message_create(start_round_message, NULL);
+    return start_round_broadcast;
 }
 
-struct *broadcast_message create_prompt_for_guess_broadcast(int guess_set_num){
-
+// TODO: decide guess set number - lock entire time so no can submit in between? store guess set somewhere separately?
+struct *broadcast_message compile_prompt_for_guess_broadcast(int guess_set_num){
+    json_t *prompt_for_guess_message = json_object();
+    json_object_set_new(prompt_for_guess_message, "MessageType", json_string("PromptForGuess"));
+    json_t *prompt_for_guess_message_data = json_object(); 
+    json_object_set_new(prompt_for_guess_message_data, "WordLength", json_integer(strlen(json_string_value(json_object_get(round_info, "Word")))));
+    // When we are prompting for a guess, we expect that everyone has submitted the last round of guessing, so everything has the same length GuessHistory
+    json_object_set_new(prompt_for_guess_message_data, "GuessNumber", json_integer(json_array_size(json_object_get(
+        json_object_iter_value(json_object_iter(player_to_info)),
+        "GuessHistory"
+    )));
+    json_object_set_new(prompt_for_guess_message_data, "Name", json_null());
+    json_object_set_new(prompt_for_guess_message, "Data", prompt_for_guess_message_data);
+    struct broadcast_message *prompt_for_guess_broadcast = broadcast_message_create(prompt_for_guess_message, dynamic_field_create("Name", resolve_name), NULL);
+    return prompt_for_guess_broadcast;
 }
 
 
 char *compute_wordle_result(char *guess, char *answer){
+    // TODO: Convert guess and answer both to uppercase to compare with answer
+    // TODO: should the guess I should send back also be all uppercase?
+    guess = 
     // Construct multiset of letters in answer
     json_t *letters = json_object();
     for(int i = 0; i < strlen(answer): ++i ){
