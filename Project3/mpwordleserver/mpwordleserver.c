@@ -19,23 +19,37 @@ Group: Graham Fisher, Tommy Gallagher, Jason Brown
 #include <libgen.h>
 #include <sys/stat.h>
 #include <math.h>
+#include <time.h>
+#include <getopt.h>
+#include <ctype.h>
 
 #include <jansson.h> // the JSON parsing library we chose to use: https://jansson.readthedocs.io/en/latest | https://github.com/akheron/jansson
 
 #define BACKLOG 10   // how many pending connections queue will hold
-#define CONFIG_PATH ".mycal"
-#define DATA_PATH "data/all_data.json"
-
-int MONTH_TO_N_DAYS[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31}; // ignores leap years
-
-json_t *global_database; // global data shared among threads
-pthread_rwlock_t global_database_lock = PTHREAD_RWLOCK_INITIALIZER; // rd/wr lock associated with global_database
-
 
 /* Data Types */
 // Note: We generally tried to use json_t for data structures as needed since we already have them, and they are very flexible and cover most use cases.
 //       However, json_t has no way to store functions (understandably), so for data structures requiring function pointers, needed to use plain ol' structs.
-typedef json_t *(*message_handler_t)(json_t *message, int sockfd, json_t **broadcast_messages_out);
+struct broadcast_message {
+    // The message to broadcast
+    json_t *message;
+    // For some messages, we desire that the value of certain fields is different for each player: thus the value must be resolved dynamically outside the broadcast_message specification
+    // A dynamic field specifies a field within message.data to resolve dynamically, and a function that can resolve it when turning this spec into messages to send to each client
+    // This is a linked list of pointers to dynamic field specs (NULL indicates end of list)
+    struct dynamic_field **dynamic_data_fields;
+};
+struct broadcast_message *broadcast_message_create(json_t *message, ...);
+void broadcast_message_destroy(struct broadcast_message *msg);
+
+typedef json_t *(*data_resolver_t)(const char *player_name);
+struct dynamic_field {
+    char *name;
+    data_resolver_t resolver;
+};
+struct dynamic_field *dynamic_field_create(char *name, data_resolver_t resolver);
+void dynamic_field_destroy(struct dynamic_field *);
+
+typedef json_t *(*message_handler_t)(json_t *message, int sockfd, struct broadcast_message ***broadcast_messages_out);
 
 struct handle_socket_thread_wrapper_arg{
     bool is_lobby;
@@ -43,23 +57,13 @@ struct handle_socket_thread_wrapper_arg{
     message_handler_t handler;
 };
 
-typedef json_t *(*data_resolver_t)(char *player_name);
-
-struct broadcast_message {
-    // The message to broadcast
-    json_t *message;
-    // For some messages, we desire that the value of certain fields is different for each player: thus the value must be resolved dynamically outside the broadcast_message specification
-    // A dynamic field specifies a field within message.data to resolve dynamically, and a function that can resolve it when turning this spec into messages to send to each client
-    // This is a linked list of pointers to dynamic field specs (NULL indicates end of list)
-    struct dynamic_field **data_fields_to_resolve;
-}
 
 // Takes the message and a NULL-terminated list of pointers to dynamic fields to embed into the broadcast
 // Note: this function *steals* the jsont_t reference to message (in the jansson sense). This is assumed to be convenient for the caller in the majority of cases.
 // Note: this function *steals* dynamic_fields (created via dynamic_field_create) in the sense that it will call dynamic_field_destroy on them when it is destroyed: the caller should NOT manually invoke destroy these dynamic_fields.
 // That is, it allows the dynamic_fields passed to live only as long as it does (this is assumed to be a service to the caller so they don't have to maintain handles to the dynamic fields).
 struct broadcast_message *broadcast_message_create(json_t *message, ...){
-    struct broadcast_message *to_return = malloc(sizeof(broadcast_message));
+    struct broadcast_message *to_return = malloc(sizeof(struct broadcast_message));
     // TODO: am I fail-checking mallocs? very unlikely and not really any recourse
 
     // Note: NOT incref'ing the message effectively steals the reference: otherwise, we would want to incref since the caller has a reference and we are saving another.
@@ -69,7 +73,7 @@ struct broadcast_message *broadcast_message_create(json_t *message, ...){
     va_list args;
     va_start(args, message);
     int n_dynamic_fields = 1; // arg list will be NULL terminated, so this count includes the NULL arg
-    while( va_arg(args, dynamic_field *) ){ // i.e., while the next field is not NULL
+    while( va_arg(args, struct dynamic_field *) ){ // i.e., while the next field is not NULL
         ++n_dynamic_fields;
     }
     va_end(args);
@@ -77,12 +81,12 @@ struct broadcast_message *broadcast_message_create(json_t *message, ...){
     // Even if no dynamic fields, dynamic_field will itself be a non-null double pointer pointing to a NULL single pointer.
     // In particular, this means we always need to allocate SOME space (at least one pointer's worth).
     // This creation function nicely encapsulates this subtlety.
-    to_return->dynamic_fields = malloc(n_dynamic_fields * sizeof(dynamic_field *));
+    to_return->dynamic_data_fields = malloc(n_dynamic_fields * sizeof(struct dynamic_field *));
     va_start(args, message);
     int idx = 0;
     struct dynamic_field *field;
-    while( field = va_arg(args, dynamic_field *) ){
-        to_return->dynamic_fields[idx] = field; // steal reference
+    while( (field = va_arg(args, struct dynamic_field *)) ){
+        to_return->dynamic_data_fields[idx] = field; // steal reference
         ++idx;
     }
     va_end(args);
@@ -92,24 +96,21 @@ struct broadcast_message *broadcast_message_create(json_t *message, ...){
 
 void broadcast_message_destroy(struct broadcast_message *msg){
     json_decref(msg->message);
-    for( int field_idx = 0; msg->dynamic_fields[field_idx]; ++field_idx ){
-        dynamic_field_destroy(msg->dynamic_fields[field_idx]);
+    for( int field_idx = 0; msg->dynamic_data_fields[field_idx]; ++field_idx ){
+        dynamic_field_destroy(msg->dynamic_data_fields[field_idx]);
     }
-    free(msg->dynamic_fields);
+    free(msg->dynamic_data_fields);
     free(msg);
 }
 
-// TODO: does this need to be before broadcast_message?
-struct dynamic_field {
-    char *name;
-    data_resolver_t resolver;
-}
 
 // Note: does NOT steal the string name, but duplicates it (to allow for non-malloc'd strings)
 struct dynamic_field *dynamic_field_create(char *name, data_resolver_t resolver){
     struct dynamic_field *field = malloc(sizeof(struct dynamic_field));
     field->name = strdup(name);
     field->resolver = resolver;
+
+    return field;
 }
 
 void dynamic_field_destroy(struct dynamic_field *field){
@@ -117,10 +118,11 @@ void dynamic_field_destroy(struct dynamic_field *field){
     free(field);
 }
 
+
 /* Globals */
 json_t *player_to_info;
 json_t *round_info;
-pthread_mutex_t *global_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t global_lock = PTHREAD_MUTEX_INITIALIZER;
 int game_accept_socket;
 
 // Default parameter values
@@ -128,26 +130,48 @@ int N_PLAYERS_PER_GAME = 2;
 int LOBBY_PORT = 4100;
 int GAME_PORT_START = 4101;
 int N_ROUNDS = 3;
-FILE *DICT_FILENAME = NULL;
+FILE *DICT_FILE = NULL;
 bool DEBUG = false;
 int N_GUESSES = 6; // not configurable
 
 /* Prototypes */
+void usage(char *invoked_as, int exit_code);
+bool process_args(int argc, char **argv);
+int validate_dictionary(FILE *dict);
+int bind_server_socket(char *port);
+void start_server(char *port, int bound_server_socket, void (*accept_handler)(int sockfd));
+void *get_in_addr(struct sockaddr *sa);
+void generic_accept_handler(bool is_lobby, int sockfd, message_handler_t handler);
+void *handle_socket_thread_wrapper(void *arg);
+void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message);
+bool dump_json(int sockfd, json_t *json);
+
+void lobby_accept_handler(int sockfd);
+json_t *lobby_message_handler(json_t *message, int sockfd, struct broadcast_message ***broadcasts);
+json_t *resolve_info_field(char *field, const char *player_name);
+json_t *resolve_nonce(const char *player_name);
+json_t *resolve_name(const char *player_name);
+char *handle_join(const char *player_name, int sockfd, int *port_out);
+
+void transition_to_game();
+char *handle_chat(const char *player_name, int sockfd, const char *text, char **text_out);
+char *verify_name(const char *player_name, int sockfd);
+void game_accept_handler(int sockfd);
+json_t *game_message_handler(json_t *message, int sockfd, struct broadcast_message ***broadcasts);
+char *handle_join_instance(const char *player_name, int nonce, int sockfd, bool *start_game_out);
+char *handle_guess(const char *player_name, const char *guess, int sockfd, int *rc);
+char *validate_guess(const char *guess);
+int score_round(json_t *round_guess_history);
+void start_next_round();
+char *select_word();
+const char *get_game_winner();
+char *compute_wordle_result(const char *guess, const char *answer);
+
+struct broadcast_message *compile_start_round_broadcast();
+struct broadcast_message *compile_prompt_for_guess_broadcast();
 json_t *get_next_request(int sockfd);
-/*
-char *get_port_from_cfg(char *cfg_pathname);
-int mkpath(char *dir_path, mode_t mode);
-json_t *load_data(char *data_path);
-void save_data(char *data_path, json_t *database, pthread_rwlock_t lock, int *exit_status);
-void *run_client_thread(void *void_args);
-void handle_client(int sockfd, json_t *database, pthread_rwlock_t lock);
-json_t *dispatch(json_t *request, json_t *database, pthread_rwlock_t lock);
-char *add_event(char **event_id_out, json_t *database, pthread_rwlock_t lock, const char *calendar_name, const char *date, const char *time, const char *duration_min, const char *name, const char *description, const char *location);
-char *remove_event(json_t *database, pthread_rwlock_t lock, const char *calendar_name, const char *event_id);
-char *update_event(json_t *database, pthread_rwlock_t lock, const char *calendar_name, const char *event_id, const char* field, const char *value);
-char *get_events_on_date(json_t **results_out, json_t *database, pthread_rwlock_t lock, const char *calendar_name, const char *date);
-char *get_events_in_range(json_t **results_out, json_t *database, pthread_rwlock_t lock, const char *calendar_name, const char *start_date, const char *end_date);
-*/
+bool str_to_int(const char *str, int *int_out);
+
 
 /* Idea:    Separate server thread for each client to listen to messages or guesses asynchronously.
  *          Obv lock when dealing with shared data and to make sure the last person in triggers a response to all.
@@ -162,23 +186,25 @@ int main(int argc, char *argv[]){
 
     // Process args
     if( !process_args(argc, argv) ){
-        usage(1);
+        usage(argv[0], 1);
     }
 
     // Setup
-    srand(NULL);
+    srand(time(NULL));
     signal(SIGCHLD, SIG_IGN);
     player_to_info = json_object();
     round_info = json_object();
 
     // Launch lobby
-    start_server(LOBBY_PORT, 0, lobby_accept_handler);
+    char port_str[6];
+    sprintf(port_str, "%d", LOBBY_PORT); // NUL-terminates
+    start_server(port_str, 0, lobby_accept_handler);
 }
 
 void usage(char *invoked_as, int exit_code){
     printf(
         "Usage: %s [options]\n"
-        "Options:
+        "Options:\n"
         "   -np X: Each game includes X players. The default is 2.\n"
         "   -lp X: The main lobby server listens on port X. The default is 4100.\n"
         "   -pp X: The starting play/game port is X. When the lobby capacity is reached, a new game begins on another port, the first being X and incrementing for future games (as availability allows). The default is 4101.\n"
@@ -197,7 +223,8 @@ bool process_args(int argc, char **argv){
     struct option game_port_start_opt = {"pp", required_argument, NULL, 2};
     struct option n_rounds_opt = {"nr", required_argument, NULL, 3};
     struct option dict_filename_opt = {"d", required_argument, NULL, 4};
-    struct option debug_on_opt {"dbg", no_argument, NULL, 5};
+    struct option debug_on_opt = {"dbg", no_argument, NULL, 5};
+    struct option sentinel = {0, 0, 0, 0};
 
     struct option longopts[7];
     longopts[0] = n_players_opt;
@@ -206,7 +233,7 @@ bool process_args(int argc, char **argv){
     longopts[3] = n_rounds_opt;
     longopts[4] = dict_filename_opt;
     longopts[5] = debug_on_opt;
-    longopts[6] = {0, 0, 0, 0}; // sentinel
+    longopts[6] = sentinel;
 
     int val, idx;
     while( (val = getopt_long_only(argc, argv, "", longopts, &idx)) > -1 ){
@@ -220,6 +247,10 @@ bool process_args(int argc, char **argv){
             case 1:
                 if( !str_to_int(optarg, &LOBBY_PORT) ){
                     fprintf(stderr, "option '-lp' expects an integer argument");
+                    return false;
+                }
+                if( LOBBY_PORT > 65535 ){
+                    fprintf(stderr, "option '-lp' expects a valid port as argument");
                     return false;
                 }
                 break;
@@ -236,12 +267,12 @@ bool process_args(int argc, char **argv){
                 }
                 break;
             case 4:
-                DICT_FILE = open(optarg, O_RDONLY);
+                DICT_FILE = fopen(optarg, "r");
                 if( !DICT_FILE ){
                     perror("couldn't open dictionary file");
                     return false;
                 }
-                line_err = validate_diciontary(DICT_FILE);
+                int line_err = validate_dictionary(DICT_FILE);
                 if( line_err ){
                     fprintf(stderr, "All words in the dictionary file must be 3-10 letters, inclusive: line %d of %s does not comply", line_err, optarg);
                     return false;
@@ -421,20 +452,20 @@ void *get_in_addr(struct sockaddr *sa)
 
 void generic_accept_handler(bool is_lobby, int sockfd, message_handler_t handler){
     // Note: this allocation will be freed at the end of the thread rountine.
-    struct handle_socket_thread_wrapper_arg *arg = malloc(sizeof struct handle_socket_thread_wrapper_arg);
+    struct handle_socket_thread_wrapper_arg *arg = malloc(sizeof(struct handle_socket_thread_wrapper_arg));
     // TODO: err check?
     arg->is_lobby = is_lobby;
     arg->sockfd = sockfd;
     arg->handler = handler;
     pthread_t thd;
     pthread_create(&thd, NULL, handle_socket_thread_wrapper, arg);
-    // Since we don't intend to join the thread, we detatch it immediately
-    pthread_detatch(thd);
+    // Since we don't intend to join the thread, we detach it immediately
+    pthread_detach(thd);
 }
 
 void *handle_socket_thread_wrapper(void *arg){
-    struct handle_socket_thread_wrapper_arg *typed_arg = (*handle_socket_thread_wrapper_arg) arg;
-    handle_socket(typed_arg->is_lobby, typed_arg->sockfd, typed_arg->handle_message);
+    struct handle_socket_thread_wrapper_arg *typed_arg = (struct handle_socket_thread_wrapper_arg *) arg;
+    handle_socket(typed_arg->is_lobby, typed_arg->sockfd, typed_arg->handler);
     free(typed_arg);
     return NULL;
 }
@@ -459,8 +490,15 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
             printf("[Info] Connection with client (via socket %d) broken: unable to recv.\n", sockfd);
             break;
         }
+
+        if( DEBUG ){
+            fprintf(stdout, "[Debug] Received message from socket %d: ", sockfd);
+            json_dumpf(request, stdout, 0);
+            fprintf(stdout, "\n");
+        }
+
         json_t *result;
-        json_t **broadcast_messages;
+        struct broadcast_message **broadcasts;
         if( json_is_string(request) ){ //  if it's a string, it's an error message
             result = json_object();
             json_object_set_new(result, "MessageType", json_string("InvalidRequest"));
@@ -469,26 +507,26 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
             //json_object_set_new(result, "Error", json_copy(request));
         }
         else{
-            result = handle_message(request, sockfd, &broadcast_messages);//, database, lock); // maybe?
+            result = handle_message(request, sockfd, &broadcasts);//, database, lock); // maybe?
         }
 
         if( result ){
             if( !dump_json(sockfd, result) ){
-                printf("[Info] Connection with client (via socket %d) broken: unable to send.\n");
+                printf("[Info] Connection with client (via socket %d) broken: unable to send.\n", sockfd);
                 break; // send failed, close cxn
             }
         }
 
-        json_t *message, *info;
+        json_t *info;
         const char *player_name;
         for( int msg_idx = 0; broadcasts[msg_idx]; ++msg_idx ){
             struct broadcast_message *msg = broadcasts[msg_idx];
             json_object_foreach(player_to_info, player_name, info){
-                for( int field_idx = 0; msg->dynamic_fields[field_idx]; ++field_idx ){
-                    struct dynamic_field *field = msg->dynamic_fields[field_idx];
-                    json_object_set_new(json_object_get(msg->message, "Data"), field->name, json_string(field->resolver(player_name)));
+                for( int field_idx = 0; msg->dynamic_data_fields[field_idx]; ++field_idx ){
+                    struct dynamic_field *field = msg->dynamic_data_fields[field_idx];
+                    json_object_set_new(json_object_get(msg->message, "Data"), field->name, field->resolver(player_name));
                 }
-                if( !dump_json(json_integer_value(json_object_get(info, "sockfd")), message) ) ;// TODO: what if one of these fails? Ignore, right? Let the 'owning' socket handle it?
+                if( !dump_json(json_integer_value(json_object_get(info, "Sockfd")), msg->message) ) ;// If one of these fails, ignore: let the 'owning' socket handle it when it discovers the socket is down
             }
             broadcast_message_destroy(msg);
         }
@@ -500,14 +538,14 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
         for( ; broadcasts[n_broadcasts]; ++n_broadcasts ) ; // advance n_broadcasts until we hit NULL
         bool was_broadcast_sent = n_broadcasts > 0;
 
-        bool was_end_game_sent = was_broadcast_sent && json_string_value(json_object_get(broadcasts[n_broadcasts - 1]->message, "MessageType")) == "EndGame";
-        bool was_start_instance_sent = was_broadcast_sent && json_string_value(json_object_get(broadcasts[n_broadcasts - 1]->message, "MessageType")) == "StartInstance";
+        bool was_end_game_sent = was_broadcast_sent && !strcmp(json_string_value(json_object_get(broadcasts[n_broadcasts - 1]->message, "MessageType")), "EndGame");
+        bool was_start_instance_sent = was_broadcast_sent && !strcmp(json_string_value(json_object_get(broadcasts[n_broadcasts - 1]->message, "MessageType")), "StartInstance");
 
         // Free broadcasts
         for( int msg_idx = 0; broadcasts[msg_idx]; ++msg_idx ){
-            broadcast_message_destroy(msg);
+            broadcast_message_destroy(broadcasts[msg_idx]);
         }
-        free(broadcast_messages);
+        free(broadcasts);
 
         // TODO: I think this never actually closes the original socket of the last person to join
         //  - since the game server is short-lived and this is a one-time occurence, there won't be any leaking of memory: should be fine to leave it as is
@@ -532,9 +570,9 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
     json_t *player_info;
     void *tmp;
     //  Note: We are sure to lock in case another thread is adding a player to player_to_info (prevent del-check | add add-check start-game | del-info)
-    if( json_object_size(player_to_info) != n_players_per_game ){
+    if( json_object_size(player_to_info) != N_PLAYERS_PER_GAME ){
         json_object_foreach_safe(player_to_info, tmp, player_name, player_info){ // use 'safe' version since we call delete within loop
-            if( json_integer_value(json_object_get(player_info, "sockfd")) == sockfd ){
+            if( json_integer_value(json_object_get(player_info, "Sockfd")) == sockfd ){
                 json_object_del(player_to_info, player_name);
                 break;
             }
@@ -556,7 +594,12 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
 }
 
 bool dump_json(int sockfd, json_t *json){
-    if( json_dumpfd(result, sockfd, JSON_COMPACT) < 0 || send(sockfd, "\n", 1, 0) != 1 ){ // takes care of sending over TCP (streaming) socket
+    if( DEBUG ){
+        fprintf(stdout, "[Debug] Sending message to socket %d: ", sockfd);
+        json_dumpf(json, stdout, 0);
+        fprintf(stdout, "\n");
+    }
+    if( json_dumpfd(json, sockfd, JSON_COMPACT) < 0 || send(sockfd, "\n", 1, 0) != 1 ){ // takes care of sending over TCP (streaming) socket
         fprintf(stderr, "[Error] Problem sending result back to client. Aborting connection...\n");
         return false;
     }
@@ -582,9 +625,9 @@ void lobby_accept_handler(int sockfd){
 
 
 // I need to "return" a double pointer, so they need to pass in a triple pointer
-jsont_t *lobby_message_handler(json_t *message, int sockfd, struct broadcast_message ***broadcasts){
+json_t *lobby_message_handler(json_t *message, int sockfd, struct broadcast_message ***broadcasts){
     char *err = NULL;
-    *broadcasts = malloc(sizeof(struct *broadcast_message));
+    *broadcasts = malloc(sizeof(struct broadcast_message *));
     **broadcasts = NULL;
 
     json_t *response = json_object();
@@ -605,12 +648,12 @@ jsont_t *lobby_message_handler(json_t *message, int sockfd, struct broadcast_mes
         json_object_set_new(response, "MessageType", json_string("ChatResult"));
 
         // Should we send an error message to the client if they don't send a valid chat?
-        char *player_name = json_object_get(message_data, "Name");
+        const char *player_name = json_string_value(json_object_get(message_data, "Name"));
         if( !player_name ){
             err = "Expected string field '.Data.Name' is missing or is not a string";
             goto return_error;
         }
-        char *text = json_string_value(json_object_get(message_data, "Text"));
+        const char *text = json_string_value(json_object_get(message_data, "Text"));
         if( !text ){
             err = "Expected string field '.Data.Text' is missing or is not a string";
             goto return_error;
@@ -625,7 +668,7 @@ jsont_t *lobby_message_handler(json_t *message, int sockfd, struct broadcast_mes
         free(text_out);
 
         free(*broadcasts); // free the placeholder
-        *broadcasts = malloc(2 * sizeof(broadcast_message *));
+        *broadcasts = malloc(2 * sizeof(struct broadcast_message *));
         (*broadcasts)[0] = chat_broadcast;
         (*broadcasts)[1] = NULL;
 
@@ -638,14 +681,14 @@ jsont_t *lobby_message_handler(json_t *message, int sockfd, struct broadcast_mes
         // We expect failure by default so we'll be ready to jump to return_error without having to set this up in each case.
         json_object_set_new(json_object_get(response, "Data"), "Result", json_string("No"));
 
-        char *player_name = json_string_value(json_object_get(message_data, "Name"));
+        const char *player_name = json_string_value(json_object_get(message_data, "Name"));
         if( !player_name ){
             err = "Expected string field '.Data.Name' is missing or is not a string";
             goto return_error;
         }
-        json_object_set_new(response_data, "Name", json_string(player_name)); // go ahead and make new ref bc I'm lazy and it's just one short-lived string
+        json_object_set_new(json_object_get(response, "Data"), "Name", json_string(player_name)); // go ahead and make new ref bc I'm lazy and it's just one short-lived string
 
-        char *client_name = json_string_value(json_object_get(message_data, "Client"));
+        const char *client_name = json_string_value(json_object_get(message_data, "Client"));
         if( !client_name ){
             err = "Expected string field '.Data.Client' is missing or is not a string";
             goto return_error;
@@ -656,9 +699,7 @@ jsont_t *lobby_message_handler(json_t *message, int sockfd, struct broadcast_mes
         if( err ) goto return_error;
 
 
-        // Distinguish cases with 'port': essentially a return code that also indicates new port if positive and indicates other things if negative
-        //  - TODO: is return code a better name?
-        //  - TODO: where to ensure game port is valid (if listening fails, choose a different port, probably incrementing until we're good)
+        // Distinguish cases with 'port': essentially a return code that also indicates new port if positive, or other cases (depending on being 0 or negative
         
         // Must ensure only one of the parent server and child server processes that return from handle_join sends responses to clients
         //  - philosophy: child server serves as the LOBBY for all joined clients for a short while while it prepares a startinstance message
@@ -675,7 +716,7 @@ jsont_t *lobby_message_handler(json_t *message, int sockfd, struct broadcast_mes
             json_t *start_instance_data = json_object();
             
             char my_host[BUFSIZ];
-            get_hostname(my_host, BUFSIZ);
+            gethostname(my_host, BUFSIZ);
             // TODO: err check?
             json_object_set_new(start_instance_data, "Server", json_string(my_host)); // fine (in fact, better) to do this on stack
             json_object_set_new(start_instance_data, "Port", json_integer(port));
@@ -715,35 +756,39 @@ jsont_t *lobby_message_handler(json_t *message, int sockfd, struct broadcast_mes
     // else, error? send back invalid MessageType or smth of sort?
 }
 
-char *resolve_info_field(char *field, char *player_name){
-    return json_string_value(json_object_get(json_object_get(player_to_info, player_name), field));
+json_t *resolve_info_field(char *field, const char *player_name){
+    return json_copy(json_object_get(json_object_get(player_to_info, player_name), field));
 }
 
-char *resolve_nonce(char *player_name){
-    return resolve_info_field("nonce", player_name);
+json_t *resolve_nonce(const char *player_name){
+    return resolve_info_field("Nonce", player_name);
 }
 
-char *handle_join(char *player_name, int sockfd, int *port_out){
+json_t *resolve_name(const char *player_name){
+    return resolve_info_field("Name", player_name);
+}
+
+char *handle_join(const char *player_name, int sockfd, int *port_out){
     *port_out = 0; // default return value (in case of error or player join but not enough for game)
 
     // If name already taken, return an error
-    bool is_name_yours = !verify_name(player_name, sockfd);
+    bool name_is_yours = !verify_name(player_name, sockfd);
     if( name_is_yours ){
         return "You have already joined the game lobby";
     }
-    bool is_name_taken = !strcmp(player_name, "mpwordle") || json_object_get(player_to_info, player_name);
+    bool name_is_taken = !strcmp(player_name, "mpwordle") || json_object_get(player_to_info, player_name);
     if( name_is_taken ){
         return "That name is taken";
     }
 
     json_t *player_info = json_object();
-    json_object_set_new(player_info, "sockfd", json_integer(sockfd));
-    json_object_set_new(player_info, "nonce", json_integer(rand() % 1000000)); // TODO: srand during setup in main
+    json_object_set_new(player_info, "Name", json_string(player_name));
+    json_object_set_new(player_info, "Sockfd", json_integer(sockfd));
+    json_object_set_new(player_info, "Nonce", json_integer(rand() % 1000000));
 
     json_object_set_new(player_to_info, player_name, player_info);
      
-    // TODO: use OS-assigned port and report to user - to hell with the start play port
-    // static next_game_port = GAME_PORT_START; // TODO where to validate this port will work?
+    // We decided to let the OS assign our game port, which we can then read and report to the user - this makes bookeeping easier (none) and accounts for the case that some port shortly following our start_play_port is take
     // If lobby now full, launch new game
     if( json_object_size(player_to_info) == N_PLAYERS_PER_GAME ){
         if( fork() ){ // parent
@@ -752,9 +797,11 @@ char *handle_join(char *player_name, int sockfd, int *port_out){
             /* Close connections to lobby clients */
             //  - use shutdown calls: this will awake threads and allow them to close their sockets and exit: see transition_to_game for long-winded explanation
             //  - making sure previous clients' threads exit is important so superfluous state doesn't build up as server runs over long period
+            const char *player_name;
+            json_t *info;
             json_object_foreach(player_to_info, player_name, info){
                 //close(json_integer_value(json_object_get(info, "sockfd")));
-                shutdown(json_integer_value(json_object_get(info, "sockfd")), SHUT_RDWR);
+                shutdown(json_integer_value(json_object_get(info, "Sockfd")), SHUT_RDWR);
             }
             
             /* Cleanup player_to_info so that we don't accumulate leak memory as we fork lobbies */
@@ -766,16 +813,16 @@ char *handle_join(char *player_name, int sockfd, int *port_out){
             *port_out = -1; // indicate we are parent server but new game has been spawned
         } else { // child: decide game port
             game_accept_socket = bind_server_socket(NULL); // TODO: does this work?
-            struct sockaddr_in sa;
-            int sa_len = sizeof(sa);
-            sa_len = sizeof(sa);
-            if (getsockname(s, &sa, &sa_len) == -1) {
+            struct sockaddr sa;
+            socklen_t sa_len = sizeof(sa);
+            if (getsockname(game_accept_socket, &sa, &sa_len) == -1) {
                 perror("getsockname() failed");
-                return -1;
+                exit(-1); // TODO: anything more intelligent to do in this case?
             }
-            *port_out = ntohs(sa.sin_port);
+            *port_out = ntohs(((struct sockaddr_in *)&sa)->sin_port);
         }
     }
+    return NULL;
 }
 
 
@@ -793,16 +840,18 @@ void transition_to_game(){
     //      - https://stackoverflow.com/questions/3589723/can-a-socket-be-closed-from-another-thread-when-a-send-recv-on-the-same-socket#:~:text=Yes%2C%20it%20is%20ok%20to,will%20report%20a%20suitable%20error.&text=In%20linux%20atleast%20it%20doesn,call%20close%20from%20another%20thread
     //      - one catch: linux doesn't guarantee that blocked recv's will unblock with err/zero data, but most implementations seem to support this
     //  - we don't do this earlier because we need the sockets alive to broadcast the game port
+    const char *player_name;
+    json_t *info;
     json_object_foreach(player_to_info, player_name, info){
-        shutdown(json_integer_value(json_object_get(info, "sockfd")), SHUT_RDWR);
+        shutdown(json_integer_value(json_object_get(info, "Sockfd")), SHUT_RDWR);
         // Mark each client as disconnected
     }
     pthread_mutex_unlock(&global_lock);
     // Start new server with slightly different accept handler
-    start_server(game_port, game_accept_socket, game_accept_handler);
+    start_server(NULL, game_accept_socket, game_accept_handler);
 }
 
-char *handle_chat(char *player_name, int sockfd, char *text, char **text_out){
+char *handle_chat(const char *player_name, int sockfd, const char *text, char **text_out){
     char *err = verify_name(player_name, sockfd);
     if( err ) return err;
 
@@ -810,8 +859,10 @@ char *handle_chat(char *player_name, int sockfd, char *text, char **text_out){
     return NULL;
 }
 
-char *verify_name(char *player_name, int sockfd){
-    return sockfd == json_integer_value(json_object_get(json_object_get(player_to_info, player_name), "sockfd")) ? NULL : return "That's not your name!";
+char *verify_name(const char *player_name, int sockfd){
+    if( sockfd != json_integer_value(json_object_get(json_object_get(player_to_info, player_name), "Sockfd")) )
+        return "That's not your name.";
+    return NULL;
 }
 
 
@@ -832,13 +883,13 @@ void game_accept_handler(int sockfd){
 }
 
 // game_message_dispatcher better name?
-// TODO: similar structure of game_message_handler and lobby_message_handler: is a generalization possible/desirable, taking a specification of functions to invoke for each message_type?
+// One may note the similar structure of game_message_handler and lobby_message_handler and wonder: is a generalization possible/desirable, taking a specification of functions to invoke for each message_type?
 //  - might be cool, but at some point need to get this project done
 //  - might be desirable if more, similarly structured handlers were expected, but they are not
-jsont_t *game_message_handler(json_t *message, int sockfd, struct broadcast_message ***broadcasts){
+json_t *game_message_handler(json_t *message, int sockfd, struct broadcast_message ***broadcasts){
     char *err = NULL;
     // Default to no broadcasts
-    *broadcasts = malloc(sizeof(struct *broadcast_message));
+    *broadcasts = malloc(sizeof(struct broadcast_message *));
     **broadcasts = NULL;
 
     json_t *response = json_object();
@@ -849,7 +900,7 @@ jsont_t *game_message_handler(json_t *message, int sockfd, struct broadcast_mess
         err = "Required string field '.MessageType' is missing or is not a string";
         goto return_error;
     }
-    json_t *message_data = json_get(message, "Data");
+    json_t *message_data = json_object_get(message, "Data");
     if( !message_data ){
         err = "Required field '.Data' is missing";
         goto return_error;
@@ -857,18 +908,18 @@ jsont_t *game_message_handler(json_t *message, int sockfd, struct broadcast_mess
 
     // Looping variables everyone in this function can use
     const char *player;
-    json_t *info, *tmp;
+    json_t *info;//, *tmp;
 
     if( !strcmp(message_type, "Chat") ){
         json_object_set_new(response, "MessageType", json_string("ChatResult"));
 
         // Should we send an error message to the client if they don't send a valid chat?
-        char *player_name = json_object_get(message_data, "Name");
+        const char *player_name = json_string_value(json_object_get(message_data, "Name"));
         if( !player_name ){
             err = "Expected string field '.Data.Name' is missing or is not a string";
             goto return_error;
         }
-        char *text = json_string_value(json_object_get(message_data, "Text"));
+        const char *text = json_string_value(json_object_get(message_data, "Text"));
         if( !text ){
             err = "Expected string field '.Data.Text' is missing or is not a string";
             goto return_error;
@@ -878,13 +929,12 @@ jsont_t *game_message_handler(json_t *message, int sockfd, struct broadcast_mess
         if( err ) goto return_error;
 
         // Copy the message since broadcast_message_create we want to (a) steal the reference, (b) potentially modify the chat
-        // TODO: check that copying an object increfs all the elements
         struct broadcast_message *chat_broadcast = broadcast_message_create(json_copy(message), NULL);
         json_object_set_new(json_object_get(chat_broadcast->message, "Data"), "Text", json_string(text_out));
         free(text_out);
 
         free(*broadcasts); // free the placeholder
-        *broadcasts = malloc(2 * sizeof(broadcast_message *));
+        *broadcasts = malloc(2 * sizeof(struct broadcast_message *));
         (*broadcasts)[0] = chat_broadcast;
         (*broadcasts)[1] = NULL;
 
@@ -971,7 +1021,10 @@ jsont_t *game_message_handler(json_t *message, int sockfd, struct broadcast_mess
             err = "Expected string field '.Data.Guess' is missing or is not a string";
             goto return_error;
         }
-        json_object_set_new(json_object_get(response, "Data"), "Guess", json_string(guess));
+        char *uppercase_guess = malloc(strlen(guess) * sizeof(char));
+        for(int i = 0; i < strlen(guess); i++) uppercase_guess[i] = toupper(guess[i]);
+        json_object_set_new(json_object_get(response, "Data"), "Guess", json_string(uppercase_guess));
+        free(uppercase_guess);
 
         int rc;
         err = handle_guess(player_name, guess, sockfd, &rc);
@@ -1001,23 +1054,21 @@ jsont_t *game_message_handler(json_t *message, int sockfd, struct broadcast_mess
             json_t *player_info = json_array();
 
             bool was_winner = false;
-            json_t *guess_results = assess_guesses(); // TODO: bad? do no work? or is thi not actually doing work, just transforming DB into clt-friendly
             json_object_foreach(player_to_info, player, info){
                 json_t *info_to_append = json_object();
                 // Don't steal references, share them
                 json_object_set(info_to_append, "Name", json_object_get(info, "Name"));
                 json_object_set(info_to_append, "Number", json_object_get(info, "Number"));
                 json_object_set(info_to_append, "ReceiptTime", json_object_get(info, "LastGuess@"));
-                // TODO: when to compute result?
-                json_object_set(info_to_append, "Result", json_object_get(guess_results, player));
-                // NOTE: I hate that I have to specify string "Yes" and "No": json supports the boolean type, why aren't we using it?
-                json_object_set(info_to_append, "Correct", json_string(player == was_winner ? "Yes" : "No")); 
+                json_object_set(info_to_append, "Result", json_object_get(info, "LastGuessResult"));
+                // NOTE: Why are we using a string to specify "Yes" and "No": json supports the boolean type, why aren't we using it?
+                was_winner = was_winner || json_object_get(info, "LastGuessCorrect") == json_true();
+                json_object_set(info_to_append, "Correct", json_string(json_object_get(info, "LastGuessCorrect") == json_true() ? "Yes" : "No"));
                 json_array_append_new(player_info, info_to_append);
             }
-            json_decref(guess_results);
 
             json_object_set_new(guess_result_message_data, "PlayerInfo", player_info);
-            json_object_set_new(guess_result_message_data, "Winner", json_string(winner ? "Yes" : "No"));
+            json_object_set_new(guess_result_message_data, "Winner", json_string(was_winner ? "Yes" : "No"));
             json_object_set_new(guess_result_message, "Data", guess_result_message_data);
             struct broadcast_message *guess_result_broadcast = broadcast_message_create(guess_result_message, NULL);
             // When present, always first
@@ -1046,7 +1097,7 @@ jsont_t *game_message_handler(json_t *message, int sockfd, struct broadcast_mess
                 json_array_append_new(player_info, info_to_append);
             }
             json_object_set_new(end_round_message_data, "PlayerInfo", player_info);
-            json_object_set_new(end_round_message_data, "RoundsRemaining", json_integer(N_ROUNDS - json_object_get(round_info, "RoundNumber") + 1)); // includes round just started
+            json_object_set_new(end_round_message_data, "RoundsRemaining", json_integer(N_ROUNDS - json_integer_value(json_object_get(round_info, "RoundNumber")) + 1)); // includes round just started
             json_object_set_new(end_round_message, "Data", end_round_message_data);
 
             struct broadcast_message *end_round_broadcast = broadcast_message_create(end_round_message, NULL);
@@ -1094,7 +1145,7 @@ jsont_t *game_message_handler(json_t *message, int sockfd, struct broadcast_mess
 
     }
     else {
-        err = "Unrecognized MessageType. Must be one of: 'JoinInstnace', 'Guess', 'Chat'";
+        err = "Unrecognized MessageType. Must be one of: 'JoinInstance', 'Guess', 'Chat'";
         json_object_set_new(response, "MessageType", json_string("InvalidRequest"));
         goto return_error;
     }
@@ -1117,22 +1168,22 @@ jsont_t *game_message_handler(json_t *message, int sockfd, struct broadcast_mess
     //
 }
 
-char *handle_join_instance(char *player_name, int nonce, int sockfd, bool *start_game_out){
+char *handle_join_instance(const char *player_name, int nonce, int sockfd, bool *start_game_out){
     static int next_player_number = 0;
 
-    json_t *info = json_object_get(player_to_info, player_name));
-    if( !info ){
+    json_t *player_info = json_object_get(player_to_info, player_name);
+    if( !player_info ){
         return "No such player exists";
     }
-    if( json_integer_value(json_object_get(info, "Nonce")) != nonce ){
+    if( json_integer_value(json_object_get(player_info, "Nonce")) != nonce ){
         return "Authentication failed: incorrect nonce";
     }
 
-    // TODO: if joined player now joining from a different socket, should we swap to expect messages from this connection instead? (seems reasonable
-    if( json_object_get(info, "Disconnected@") == json_null() ){ // json_null is primitive: no mem leak and comparison works
+    // TODO: if joined player now joining from a different socket, should we swap to expect messages from this connection instead? (seems reasonable)
+    if( json_object_get(player_info, "Disconnected@") == json_null() ){ // json_null is primitive: no mem leak and comparison works
         return "You've already joined this instance";
     }
-    json_object_set_new(info, "Sockfd", json_integer(sockfd));
+    json_object_set_new(player_info, "Sockfd", json_integer(sockfd));
     // TODO: extension: implement sophisticated disconnect system
     //  - set disconnected@ in transition_to_game
     //  - in game server's main accept loop, wait minimum of 60 - (current time - player[disconnected@])
@@ -1142,15 +1193,15 @@ char *handle_join_instance(char *player_name, int nonce, int sockfd, bool *start
     //      - idea: when they rejoin: send them startgame, startround, promptforguess as appropriate
     //      - this seems to require that we remember entire history for the round, and include it in promptforguess (or we can have another informative message)
     //  - need similar system for individual clt thds? or should we let chat/gibberish reqs keep the cxn alive?
-    json_object_set_new(info, "Disconnected@", json_null());
+    json_object_set_new(player_info, "Disconnected@", json_null());
     
     // If a player is reconnecting, do not reset their round guess history
-    if( !json_object_get(info, "RoundGuessHistory") ){
-        json_object_set_new(info, "RoundGuessHistory", json_array());
+    if( !json_object_get(player_info, "RoundGuessHistory") ){
+        json_object_set_new(player_info, "RoundGuessHistory", json_array());
     }
     // If player is reconnecting, reuse their previously assigned number
-    if( !json_object_get(info, "Number") ){
-        json_object_set_new(info, "Number", json_integer(next_player_number++));
+    if( !json_object_get(player_info, "Number") ){
+        json_object_set_new(player_info, "Number", json_integer(next_player_number++));
     }
 
     // TODO: if reconnecting, need some way to check to not trigger start_game_broadcasts to everyone?
@@ -1158,6 +1209,8 @@ char *handle_join_instance(char *player_name, int nonce, int sockfd, bool *start
     // - might require the broadcast becoming a multicast (be able to specify recipients)
     // - otherwise, could detect a reconnect and send a special message containing all info needed to catch up (round number, word length, your guess history, all players' results history, guess number)
     *start_game_out = true;
+    const char *player;
+    json_t *info;
     json_object_foreach(player_to_info, player, info){
         if( !json_equal(json_object_get(info, "Disconnected@"), json_null()) ){ // as a singleton, json_null does not need to be decref'd and thus there is no leak here
             *start_game_out = false;
@@ -1172,15 +1225,15 @@ char *handle_join_instance(char *player_name, int nonce, int sockfd, bool *start
     return NULL;
 }
 
-char *handle_guess(char *player_name, char *guess, int sockfd, int *rc){
-    struct timespec tp; // TODO: include time.h
+char *handle_guess(const char *player_name, const char *guess, int sockfd, int *rc){
+    struct timespec tp;
     clock_gettime(CLOCK_REALTIME, &tp);
     // Verify name
     char *err = verify_name(player_name, sockfd);
     if( err ) return err;
 
-    // Verify guess
-    err = verify_guess(guess);
+    // Validate guess
+    err = validate_guess(guess);
     if( err ) return err;
 
     // Ensure we don't get too far ahead
@@ -1201,14 +1254,14 @@ char *handle_guess(char *player_name, char *guess, int sockfd, int *rc){
     // Record guess
     json_array_append_new(json_object_get(json_object_get(player_to_info, player_name), "RoundGuessHistory"), json_string(guess));
     char formatted_time[BUFSIZ];
-    sprintf(formatted_time, "%d.%*d", tp->tv_sec, 6, tp->nsec / 1000); // nano * 10^3 = micro
+    sprintf(formatted_time, "%lld.%*lld", (long long) tp.tv_sec, 6, (long long) tp.tv_nsec / 1000); // nano * 10^3 = micro
     json_object_set(json_object_get(player_to_info, player_name), "LastGuess@", json_string(formatted_time));
     
     // NOTE: could either be
     //  (a) LAZY - do minimum work now: just record answer and wait to process it later when everyone has submitted, or 
     //  (b) EAGER - do processing of this answer now, potentially eating up CPU time that could be spent helping someone else submit their answer
     // Conclusion: better to be EAGER here because we expect that players will be submitting at different times, so this gives the server something to do when it might otherwise be idle.
-    char *guess_result = compute_wordle_result(guess, current_word);
+    char *guess_result = compute_wordle_result(guess, json_string_value(json_object_get(round_info, "Word")));
     json_object_set_new(json_object_get(player_to_info, player_name), "LastGuessResult", json_string(guess_result));
     free(guess_result);
 
@@ -1221,41 +1274,39 @@ char *handle_guess(char *player_name, char *guess, int sockfd, int *rc){
         bool last_guess_set_end = json_array_size(json_object_get(json_object_iter_value(json_object_iter(player_to_info)), "RoundGuessHistory")) == N_GUESSES;
         bool winner_end = false;
         json_object_foreach(player_to_info, player, info){
-            bool guess_correct = strspn(json_string_value(json_object_get(info, "LastGuessResult"), "G") == strlen(current_word);
+            bool guess_correct = strspn(json_string_value(json_object_get(info, "LastGuessResult")), "G") == json_string_length(json_object_get(round_info, "Word"));
             if( guess_correct ){
                 winner_end = true;
             }
-            json_object_set_new(info, "LastGuessCorrect", json_bool(guess_correct));
+            json_object_set_new(info, "LastGuessCorrect", json_boolean(guess_correct));
         }
         bool round_end = last_guess_set_end || winner_end;
         if( round_end ) start_next_round();
         *rc += round_end;
     }
     if( *rc == 2 ){
-        bool game_end = current_round == N_ROUNDS;
+        bool game_end = json_integer_value(json_object_get(round_info, "RoundNumber")) == N_ROUNDS;
         *rc += game_end;
     }
     return NULL;
 }
 
-char *verify_guess(char *guess){
-    if( strlen(guess) != strlen(current_word) ){
+char *validate_guess(const char *guess){
+    if( strlen(guess) != json_string_length(json_object_get(round_info, "Word")) ){
         return "Your guess is the wrong length";
     }
 
     return NULL;
 }
 
-// TODO: ensure consistent capitalization for keys of info of player_to_info
-
 // Crude scoring function that gives a player 1 point if they got the word right, and 0 otherwise
 int score_round(json_t *round_guess_history){
     return round_guess_history
         && !json_array_size(round_guess_history)
-        && json_equals(
-        json_array_get(round_guess_history, json_array_size(round_guess_history) - 1),
-        json_object_get(round_info, "Word")
-    );
+        && json_equal(
+            json_array_get(round_guess_history, json_array_size(round_guess_history) - 1),
+            json_object_get(round_info, "Word")
+        );
 }
 
 // We have determined that no locking is necessary in this function.
@@ -1274,9 +1325,11 @@ int score_round(json_t *round_guess_history){
 // So, what would make the MOST sense is to use select/poll where requests are serialized so that they do not interfere with each other in this way.
 // This implementation will essentially be re-implementing select/poll in a hackish way since due to time constraints we cannot refactor into a select/poll method.
 void start_next_round(){
+    const char *player;
+    json_t *info;
     json_object_foreach(player_to_info, player, info){
         int current_score = json_integer_value(json_object_get(info, "Score"));
-        int round_score = score_round(current_word, json_object_get(info, "RoundGuessHistory"));
+        int round_score = score_round(json_object_get(info, "RoundGuessHistory"));
         json_object_set_new(info, "LastRoundScore", json_integer(round_score));
         json_object_set_new(info, "Score", json_integer(current_score + round_score));
         json_array_clear(json_object_get(info, "RoundGuessHistory"));
@@ -1284,7 +1337,8 @@ void start_next_round(){
     char *next_word = select_word();
     json_object_set_new(round_info, "Word", json_string(next_word));
     free(next_word);
-    json_object_set_new(round_info, "RoundNumber", json_integer(json_object_get(round_info, "RoundNumber") + 1)); // NOTE: if RoundNumber not yet set, json_integer will return 0, and thus we will start at round 1: perfect!
+    // NOTE: if RoundNumber not yet set, json_integer will return 0, and thus we will start at round 1: perfect!
+    json_object_set_new(round_info, "RoundNumber", json_integer(json_integer_value(json_object_get(round_info, "RoundNumber")) + 1));
 }
 
 char *select_word(){
@@ -1309,7 +1363,9 @@ char *select_word(){
 }
 
 const char *get_game_winner(){
-    char *curr_arg_max = NULL;
+    const char *curr_arg_max = NULL;
+    const char *player;
+    json_t *info;
     json_object_foreach(player_to_info, player, info){
         if( json_integer_value(json_object_get(info, "Score")) > json_integer_value(json_object_get(json_object_get(player_to_info, curr_arg_max), "Score")) ){
             curr_arg_max = player;
@@ -1318,16 +1374,16 @@ const char *get_game_winner(){
     return curr_arg_max;
 }
 
-// TODO: global round_info containing word, roundnumber
-
-struct *broadcast_message compile_start_round_broadcast(){
+struct broadcast_message *compile_start_round_broadcast(){
     json_t *start_round_message = json_object();
     json_object_set_new(start_round_message, "MessageType", json_string("StartRound"));
     json_t *start_round_message_data = json_object(); 
     json_object_set(start_round_message_data, "Round", json_object_get(round_info, "RoundNumber"));
-    json_object_set_new(start_round_message_data, "RoundsRemaining", json_integer(N_ROUNDS - json_object_get(round_info, "RoundNumber") + 1)); // equal to N_ROUNDS - current_round + 1
-    json_object_set_new(start_round_message_data, "WordLength", json_integer(strlen(json_string_value(json_object_get(round_info, "Word")))));
+    json_object_set_new(start_round_message_data, "RoundsRemaining", json_integer(N_ROUNDS - json_integer_value(json_object_get(round_info, "RoundNumber")) + 1)); // equal to N_ROUNDS - current_round + 1
+    json_object_set_new(start_round_message_data, "WordLength", json_integer(json_string_length(json_object_get(round_info, "Word"))));
     json_t *player_info = json_array();
+    const char *player;
+    json_t *info;
     json_object_foreach(player_to_info, player, info){
         json_t *info_to_append = json_object();
         // Don't steal references, share them
@@ -1343,7 +1399,7 @@ struct *broadcast_message compile_start_round_broadcast(){
     return start_round_broadcast;
 }
 
-struct *broadcast_message compile_prompt_for_guess_broadcast(int guess_set_num){
+struct broadcast_message *compile_prompt_for_guess_broadcast(){
     json_t *prompt_for_guess_message = json_object();
     json_object_set_new(prompt_for_guess_message, "MessageType", json_string("PromptForGuess"));
     json_t *prompt_for_guess_message_data = json_object(); 
@@ -1351,8 +1407,8 @@ struct *broadcast_message compile_prompt_for_guess_broadcast(int guess_set_num){
     // When we are prompting for a guess, we expect that everyone has submitted the last round of guessing, so everything has the same length GuessHistory
     json_object_set_new(prompt_for_guess_message_data, "GuessNumber", json_integer(json_array_size(json_object_get(
         json_object_iter_value(json_object_iter(player_to_info)),
-        "GuessHistory"
-    )));
+        "RoundGuessHistory"
+    ))));
     json_object_set_new(prompt_for_guess_message_data, "Name", json_null());
     json_object_set_new(prompt_for_guess_message, "Data", prompt_for_guess_message_data);
     struct broadcast_message *prompt_for_guess_broadcast = broadcast_message_create(prompt_for_guess_message, dynamic_field_create("Name", resolve_name), NULL);
@@ -1360,50 +1416,47 @@ struct *broadcast_message compile_prompt_for_guess_broadcast(int guess_set_num){
 }
 
 
-char *compute_wordle_result(char *guess, char *answer){
-    // TODO: Convert guess and answer both to uppercase to compare with answer
-    // TODO: should the guess I should send back also be all uppercase?
-    guess = 
+char *compute_wordle_result(const char *guess, const char *answer){
     // Construct multiset of letters in answer
     json_t *letters = json_object();
-    for(int i = 0; i < strlen(answer): ++i ){
+    for(int i = 0; i < strlen(answer); ++i ){
         char letter_as_str[2];
-        letter_as_str[0] = answer[i];
+        letter_as_str[0] = toupper(answer[i]);
         letter_as_str[0] = '\0';
-        json_object_set_new(letters, letter_as_str, json_integer(json_integer_value(json_object_get(letter, letter_as_str)) + 1)); // if not present, get returns NULL, int_value returns 0, so adding 1 is fine
+        json_object_set_new(letters, letter_as_str, json_integer(json_integer_value(json_object_get(letters, letter_as_str)) + 1)); // if not present, get returns NULL, int_value returns 0, so adding 1 is fine
     }
 
     char *result = calloc(strlen(guess)+1, sizeof(char));
     // First consume all green letters
     for(int i = 0; i < strlen(guess); i++){
-        if( guess[i] = answer[i] ){
-            result[i] = "G";
+        if( toupper(guess[i]) == toupper(answer[i]) ){
+            result[i] = 'G';
 
             char letter_as_str[2];
-            letter_as_str[0] = answer[i];
+            letter_as_str[0] = toupper(answer[i]);
             letter_as_str[0] = '\0';
-            json_object_set_new(letters, letter_as_str, json_integer(json_integer_value(json_object_get(letter, letter_as_str)) - 1)); 
+            json_object_set_new(letters, letter_as_str, json_integer(json_integer_value(json_object_get(letters, letter_as_str)) - 1)); 
         }
     }
 
     // Then consume all yellow letters
     // Mark only as many of each letter as are in actual word
     for(int i = 0; i < strlen(guess); i++){
-        if( result[i] == "G" ) continue;
+        if( result[i] == 'G' ) continue;
 
         char letter_as_str[2];
-        letter_as_str[0] = answer[i];
+        letter_as_str[0] = toupper(answer[i]);
         letter_as_str[0] = '\0';
         if( json_integer_value(json_object_get(letters, letter_as_str)) ){
-            result[i] = "Y";
-            json_object_set_new(letters, letter_as_str, json_integer(json_integer_value(json_object_get(letter, letter_as_str)) - 1)); 
+            result[i] = 'Y';
+            json_object_set_new(letters, letter_as_str, json_integer(json_integer_value(json_object_get(letters, letter_as_str)) - 1)); 
         }
     }
 
     // Rest are black
     for(int i = 0; i < strlen(guess); i++){
-        if( result[i] == "G" || result[i] == "Y" ) continue;
-        result[i] = "B";
+        if( result[i] == 'G' || result[i] == 'Y' ) continue;
+        result[i] = 'B';
     }
     return result;
 }
@@ -1416,7 +1469,7 @@ json_t *get_next_request(int sockfd){
     }
     if( !buffer ){
         fprintf(stderr, "[Error] Memory allocation failed: %s. Aborting...\n", strerror(errno));
-        save_and_exit(1);
+        exit(1);
     }
     static int space_remaining = BUFSIZ; // essentially tracks end of meaningful data in buffer
     // No reordering necessary when datatype is a single byte: endianness refers ontly to whether most- or least-significant BYTE comes first (its called BYTE order)
@@ -1449,7 +1502,7 @@ json_t *get_next_request(int sockfd){
             char *small_buffer = malloc(BUFSIZ);
             if( !small_buffer ){
                 fprintf(stderr, "[Error] Memory allocation failed: %s. Aborting...\n", strerror(errno));
-                save_and_exit(1);
+                exit(1);
             }
             strncpy(small_buffer, newline + 1, n_bytes_to_preserve);
             free(buffer); // release space after each request: if we keep adding onto same buffer we will consume lots of memory we aren't using
@@ -1471,7 +1524,7 @@ json_t *get_next_request(int sockfd){
             buffer = realloc(buffer, current_bufsiz_multiple * BUFSIZ);
             if( !buffer ){
                 fprintf(stderr, "[Error] Memory allocation failed: %s. Aborting...\n", strerror(errno));
-                save_and_exit(1);
+                exit(1);
             }
             space_remaining = BUFSIZ;
         }
@@ -1499,653 +1552,3 @@ bool str_to_int(const char *str, int *int_out){
     return true;
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-char *get_port_from_cfg(char *cfg_pathname){
-    /*** Read port from cfg file ***/
-    
-    // parse json cfg file
-    FILE *cfg_file = fopen(cfg_pathname, "r");
-    json_t *cfg_contents = json_loadf(cfg_file, 0, NULL); 
-    if( !cfg_contents ){
-        return NULL;
-    }
-    // access correct field of the struct
-    json_t *port_json = json_object_get(cfg_contents, "port");
-    if( !port_json ){
-        return NULL;
-    }
-
-    const char *port = json_string_value(port_json); // need to be const char *?
-    // copy over port so it is not lost when cfg_contents destroyed
-    char *port_to_return = malloc(strlen(port)+1); // caller needs to free returned string
-    sprintf(port_to_return, "%s", port); // sprintf adds a nul terminator
-
-    // cleanup
-    json_decref(cfg_contents); // frees port_json, too (borrowed reference)
-    fclose(cfg_file);
-
-    return port_to_return;
-}
-
-int mkpath(char *dir_path, mode_t mode){
-    if( !dir_path ){
-        errno = EINVAL;
-        return -1;
-    }
-    // base case: current directory or root
-    if( !strcmp(dir_path, ".") || !strcmp(dir_path, "/") ){
-        return 0;
-    }
-
-    char *dir_path_copy = strdup(dir_path);
-    if( !dir_path_copy ){
-        return -1;
-    }
-
-    int rc;
-    rc = mkpath(dirname(dir_path_copy), mode);
-    free(dir_path_copy);
-    if( rc < 0 ){
-        return -1;
-    }
-    rc = mkdir(dir_path, mode);
-    if( rc < 0 && errno != EEXIST ){
-        return -1;
-    }
-    return 0;
-}
-
-json_t *load_data(char *data_path){
-    /*** Load data from json file ***/
-
-    // Try to load from data_path
-    FILE *data_file = fopen(data_path, "r");
-    // If data loading fails, try to create directories along the way
-    // I think it would make more sense to be lazier and create dir just before saving but instructions suggest this approach
-    if( !data_file && errno == ENOENT ){ 
-        // Parse until slash
-        // abc/def
-        char *last_slash = strrchr(data_path, '/');
-        char* dir_path = malloc(last_slash - data_path + 1);
-        snprintf(dir_path, last_slash - data_path + 1, "%s", data_path); // writes a nul terminator
-        if( mkpath(dir_path, S_IRWXU | S_IRWXO) < 0 ){
-            perror("[Error] Failed to make path to data save location");
-            exit(1);
-        }
-        free(dir_path);
-        return json_object(); // no data to load
-    }
-    json_t *data = json_loadf(data_file, 0, NULL);
-    fclose(data_file);
-    return data;
-
-    /*** Internal data storage format ***/
-    // note: jansson uses a hash table underneath so we can use its JSON objects and have it handle hashing, plus be ready to encode when time comes
-    /*
-        {
-            <calendar name>: {
-                <date>: [
-                    {
-                        time: <HHMM>,
-                        duration: <num min>,
-                        name: <string>,
-                        description: <string>,
-                        location: <string>,
-                        removed: <bool>
-                    }
-                ]
-            }
-        }
-    */
-    // Note that we use the date as a hash key so that we can index events quickly and easily based on date to serve get and getrange requests
-    // Note that we will use the following scheme for eventids: "<date><idx>" where idx is the 0-based index of the event within the date (since, according to assignment instructions, we don't have to worry about the server needing to work on the same calendar from multiple threads, we can treat the server as a serialization points, i.e., assume that events are put into the data structure in the same order)
-}
-
-void save_data(char *data_path, json_t *database, pthread_rwlock_t lock, int *exit_status){
-    // Potential problems with multithreading:
-    //  - two threads have failures, so each tries to save and exit
-    //  - while the first writes, the second cannot since file has lock
-    //  - however, once first releases lock, what if second runs, erases file, then first runs and exits
-    //  - so, if exiting, we do it before closing the file so that someone else can't modify the file before we erase it
-    FILE *data_file = fopen(data_path, "w");
-    if( !data_file ){
-        fprintf(stderr, "[Error] Unable to save database: could not open save file\n");
-    }
-    pthread_rwlock_rdlock(&lock);
-    json_dumpf(database, data_file, JSON_COMPACT);
-    pthread_rwlock_unlock(&lock);
-    if( exit_status ) exit(*exit_status);
-    fclose(data_file);
-}
-
-void save_and_exit(int exit_status){ save_data(DATA_PATH, global_database, global_database_lock, &exit_status); }
-
-void *run_client_thread(void *void_args){
-    sigset_t set;
-    sigemptyset(&set);
-    sigaddset(&set, SIGINT);
-    pthread_sigmask(SIG_BLOCK, &set, NULL); // only the main thread should receive SIGINT (and save data in response)
-    struct client_thread_args *args = (struct client_thread_args *)void_args;
-    handle_client(args->sockfd, global_database, global_database_lock);
-    return NULL;
-}
-
-void handle_client(int sockfd, json_t *database, pthread_rwlock_t lock){
-    while(true){
-        json_t *next_request = get_next_request(sockfd);
-        if( !next_request ){
-            printf("[Info] Connection with client broken.\n");
-            break;
-        }
-        json_t *result;
-        if( json_is_string(next_request) ){ //  if it's a string, its an error message
-            result = json_object();
-            json_object_set_new(result, "success", json_false());
-            json_object_set_new(result, "error", json_copy(next_request));
-        }
-        else{
-            result = dispatch(next_request, database, lock);
-        }
-        int rc = json_dumpfd(result, sockfd, JSON_COMPACT); // takes care of sending over TCP (streaming) socket
-        if( rc < 0 ){
-            fprintf(stderr, "[Error] Problem sending result back to client. Aborting connection...\n");
-            break;
-        }
-        if( send(sockfd, "\n", 1, 0) != 1 ){
-            fprintf(stderr, "[Error] Problem sending result back to client. Aborting connection...\n");
-            break;
-        }
-
-        json_decref(next_request);
-        json_decref(result);
-    }
-    close(sockfd);
-}
-
-json_t *dispatch(json_t *request, json_t *database, pthread_rwlock_t lock){
-    json_t *result = json_object();
-    const char *command = json_string_value(json_object_get(request, "command"));
-    if( !(command) ){
-        // BAD REQUEST: NO COMMAND
-        json_object_set_new(result, "success", json_false());
-        json_object_set_new(result, "error", json_string("Request payload is missing 'command' field"));
-        json_object_set_new(result, "identifier", json_string("XXXX"));
-        return result;
-    }
-    json_object_set_new(result, "command", json_copy(json_object_get(request, "command"))); // creates a new reference so we don't have to spend 2 extra lines first fetching and then increffing request.command
-
-    const char *calendar_name;
-    if( !(calendar_name = json_string_value(json_object_get(request, "calendar"))) ){
-        // BAD REQUEST: NO CALENDAR
-        json_object_set_new(result, "success", json_false());
-        json_object_set_new(result, "error", json_string("Request payload is missing 'calendar' field"));
-        json_object_set_new(result, "identifier", json_string("XXXX"));
-        return result;
-    }
-    json_object_set_new(result, "calendar", json_copy(json_object_get(request, "calendar"))); // creates a new reference so we don't have to spend 2 extra lines first fetching and then increffing request.calendar
-
-    if( !strcmp(command, "add") ){
-        const char *calendar_name, *date, *time, *duration_min, *name, *description = NULL, *location = NULL;
-        int rc = json_unpack(request,
-            "{ s:s, s:s, s:s, s:s, s:s, s:s,"
-            "  s?:s, s?:s }",
-            "command", &command,
-            "calendar", &calendar_name,
-            "date", &date,
-            "time", &time,
-            "duration", &duration_min,
-            "name", &name,
-            "description", &description,
-            "location", &location
-        );
-        if( rc < 0 ){
-            // BAD REQUEST: WRONG FORMAT
-            json_object_set_new(result, "success", json_false());
-            json_object_set_new(result, "error", json_string("Invalid request format: expected keys of calendar, date, time, duration, name, and, optionally, description and location, each with a string value."));
-            json_object_set_new(result, "identifier", json_string("XXXX"));
-            return result;
-        }
-        char *added_event_id;
-        char *error = add_event(
-            &added_event_id,
-            database, lock,
-            calendar_name,
-            date, time, duration_min,
-            name, description, location
-        );
-        // Finish constructing result
-        json_object_set_new(result, "success", json_boolean(!error));
-        if( error ){
-            json_object_set_new(result, "error", json_string(error));
-            json_object_set_new(result, "identifier", json_string("XXXX"));
-        }
-        else {
-            json_object_set_new(result, "identifier", json_string(added_event_id));
-            // Inspecting the jansson source, json_string makes a copy of the string input, so it is safe to free this here
-            free(added_event_id);
-        }
-        return result;
-    }
-    if( !strcmp(command, "remove") ){
-        char *calendar_name, *event_id;
-        int rc = json_unpack(request,
-            "{ s:s, s:s, s:s }",
-            "command", &command,
-            "calendar", &calendar_name,
-            "event_id", &event_id
-        );
-        if( rc < 0 ){
-            // BAD REQUEST: WRONG FORMAT
-            json_object_set_new(result, "success", json_false());
-            json_object_set_new(result, "error", json_string("Invalid request format: expected keys of calendar and event_id, each with a string value."));
-            json_object_set_new(result, "identifier", json_string("XXXX"));
-            return result;
-        }
-
-        char *error = remove_event(
-            database, lock,
-            calendar_name,
-            event_id
-        );
-        // Finish constructing result
-        json_object_set_new(result, "success", json_boolean(!error));
-        if( error ){
-            json_object_set_new(result, "error", json_string(error));
-            json_object_set_new(result, "identifier", json_string("XXXX"));
-        }
-        else {
-            json_object_set_new(result, "identifier", json_string(event_id));
-        }
-        return result; 
-    }
-    if( !strcmp(command, "update") ){
-        char *calendar_name, *event_id, *field, *value;
-        int rc = json_unpack(request,
-            "{ s:s, s:s, s:s, s:s, s:s }",
-            "command", &command,
-            "calendar", &calendar_name,
-            "event_id", &event_id,
-            "field", &field,
-            "value", &value
-        );
-        if( rc < 0 ){
-            // BAD REQUEST: WRONG FORMAT
-            json_object_set_new(result, "success", json_false());
-            json_object_set_new(result, "error", json_string("Invalid request format: expected keys of calendar, event_id, field, and value, each with a string value."));
-            json_object_set_new(result, "identifier", json_string("XXXX"));
-            return result;
-        }
-        char *error = update_event(
-            database, lock,
-            calendar_name,
-            event_id,
-            field,
-            value
-        );
-        // Finish constructing result
-        json_object_set_new(result, "success", json_boolean(!error));
-        if( error ){
-            json_object_set_new(result, "error", json_string(error));
-            json_object_set_new(result, "identifier", json_string("XXXX"));
-        }
-        else {
-            json_object_set_new(result, "identifier", json_string(event_id));
-        }
-        return result; 
-    }
-    if( !strcmp(command, "get") ){
-        char *calendar_name, *date;
-        int rc = json_unpack(request,
-            "{ s:s, s:s, s:s }",
-            "command", &command,
-            "calendar", &calendar_name,
-            "date", &date
-        );
-        if( rc < 0 ){
-            // BAD REQUEST: WRONG FORMAT
-            json_object_set_new(result, "success", json_false());
-            json_object_set_new(result, "error", json_string("Invalid request format: expected keys of calendar and date, each with a string value."));
-            //json_object_set_new(result, "identifier", json_string("XXXX"));
-            return result;
-        }
-        json_t *events_on_date;
-        char *error = get_events_on_date(
-            &events_on_date,
-            database, lock,
-            calendar_name,
-            date
-        );
-        // Finish constructing result
-        json_object_set_new(result, "success", json_boolean(!error));
-        if( error ){
-            json_object_set_new(result, "error", json_string(error));
-            //json_object_set_new(result, "identifier", json_string("XXXX"));
-        }
-        else {
-            json_object_set_new(result, "data", events_on_date); // give ownership of queried data events_on_date to result
-        }
-        return result; 
-    }
-    if( !strcmp(command, "getrange") ){
-        char *calendar_name, *start_date, *end_date;
-        int rc = json_unpack(request,
-            "{ s:s, s:s, s:s, s:s }",
-            "command", &command,
-            "calendar", &calendar_name,
-            "start_date", &start_date,
-            "end_date", &end_date
-        );
-        if( rc < 0 ){
-            // BAD REQUEST: WRONG FORMAT
-            json_object_set_new(result, "success", json_false());
-            json_object_set_new(result, "error", json_string("Invalid request format: expected keys of calendar, start_date, and end_date, each with a string value."));
-            //json_object_set_new(result, "identifier", json_string("XXXX"));
-            return result;
-        }
-        json_t *events_on_dates;
-        char *error = get_events_in_range(
-            &events_on_dates,
-            database, lock,
-            calendar_name,
-            start_date,
-            end_date
-        );
-        // Finish constructing result
-        json_object_set_new(result, "success", json_boolean(!error));
-        if( error ){
-            json_object_set_new(result, "error", json_string(error));
-            //json_object_set_new(result, "identifier", json_string("XXXX"));
-        }
-        else {
-            json_object_set_new(result, "data", events_on_dates); // give ownership of queried data events_on_dates to result
-        }
-        return result; 
-    }
-
-    // Else, command invalid
-    char *error_msg = "Invalid command (expected one of: add, update, remove, get, getrange)";
-    json_object_set_new(result, "error", json_string(error_msg));
-    json_object_set_new(result, "success", json_false());
-    json_object_set_new(result, "identifier", json_string("XXXX"));
-    return result;
-}
-
-/*** Data utilities ***/
-bool validate_date(const char* date, int *month_out, int *day_out, int *year_out){
-    if( strlen(date) != 6 ){
-        return false;
-    }
-    char month_str[3], day_str[3], year_str[3]; 
-    sscanf(date, "%2s%2s%2s", month_str, day_str, year_str); // sscanf adds NULs to parsed strings
-    int month = atoi(month_str);
-    int day = atoi(day_str);
-    int year = atoi(year_str);
-
-    if( month <= 0 || month > 12 ) return false;
-    if( day <= 0 || day > MONTH_TO_N_DAYS[month] ) return false;
-    // Any year is valid
-
-    if( month_out ) *month_out = month;
-    if( day_out ) *day_out = day;
-    if( year_out ) *year_out = year;
-    return true;
-}
-
-bool validate_time(const char *time, int *hour_out, int *minute_out){
-    if( strlen(time) != 4 ){
-        return false;
-    }
-    char hour_str[3], minute_str[3]; 
-    sscanf(time, "%2s%2s", hour_str, minute_str); // sscanf adds NULs to parsed strings
-    int hour = atoi(hour_str);
-    int minute = atoi(minute_str);
-
-    if( hour < 0 || hour > 23 ) return false;
-    if( minute < 0 || minute > 59 ) return false;
-
-    if( hour_out ) *hour_out = hour;
-    if( minute_out ) *minute_out = minute;
-    return true;
-}
-
-int parse_event_id(const char *event_id, char *date, int *id_on_date){
-    // date and id_on_date MUST be preallocated with spaces of 7 chars for date and 1 int for id_on_date
-    strncpy(date, event_id, 6);
-    date[6] = '\0';
-    *id_on_date = atoi(event_id + 7);
-    return 0;
-}
-
-/*** Action function return schemes ***/
-// Things we need to communicate back to caller
-//  - success?
-//  - err msg (string)
-//  - result (type varies)
-// However, success can be inferred from the absence of an error.
-// Therefore, to facilitate easy error-checking, I suggest that every function return their error message (or NULL on success).
-// This leaves the result to be passed back via a parameter.
-char *add_event(char **event_id_out, json_t *database, pthread_rwlock_t lock, const char *calendar_name, const char *date, const char *time, const char *duration_min, const char *name, const char *description, const char *location){
-    // Use strings for internal storage of ALL fields for simplicity
-
-    /*** Validation ***/
-    if( !validate_date(date, NULL, NULL, NULL) ){
-        return "Invalid date (expected 'MMDDYY')";
-    }
-    if( !validate_time(time, NULL, NULL) ){
-        return "Invalid time (expected 'HHMM')";
-    }
-    if( !str_to_int(duration_min, NULL) ){
-        return "Invalid duration (expected integer-convertible string)";
-    }
-
-    pthread_rwlock_wrlock(&lock);
-    // If no event has been added to calendar yet, create a calendar object
-    json_t *calendar = json_object_get(database, calendar_name);
-    if( !calendar ){
-        calendar = json_object();
-        json_object_set_new(database, calendar_name, calendar); // ref stolen by "new": no need to decref later
-    }
-    // If not event has been added to this date in the calendar yet, create a date array
-    json_t *cal_date = json_object_get(calendar, date);
-    if( !cal_date ){
-        cal_date = json_array();
-        json_object_set_new(calendar, date, cal_date); // ref stolen by "new": no need to decref later
-    }
-
-    /*** Now that we have a cal_date array, and append the new event ***/
-    int id_on_date = json_array_size(cal_date); // save for later
-
-    // Create a new event and add the expected fields
-    json_t *new_event = json_object();
-    json_object_set_new(new_event, "time", json_string(time));
-    json_object_set_new(new_event, "duration", json_string(duration_min));
-    json_object_set_new(new_event, "name", json_string(name));
-    json_object_set_new(new_event, "description", description ? json_string(description): json_null());
-    json_object_set_new(new_event, "location", location ? json_string(location): json_null());
-    json_object_set_new(new_event, "removed", json_false());
-    
-    json_array_append_new(cal_date, new_event); // hands off reference to calendar
-    pthread_rwlock_unlock(&lock);
-
-    if( event_id_out ){
-        // Construct event id from date and id_on_date
-        // TODO: this event_id will be embedded in a json_t which will later be decref'd: does that free this string? If not, does it copy so that we can free this after returning?
-        int id_len = id_on_date > 0 ? ceil(log10(id_on_date)) : 1;
-        char *event_id = malloc(6 + 1 + id_len + 1); // 6 = len(MMDDYY), 1 = len(":"), 1 = len("\0")
-        sprintf(event_id, "%s:%d", date, id_on_date);
-
-        *event_id_out = event_id;
-    }
-
-    return NULL;
-}
-
-char *remove_event(json_t *database, pthread_rwlock_t lock, const char *calendar_name, const char *event_id){
-    // TODO: do I need to get access to old value of "removed" and decref?
-    // I wouldn't think so: I'd think the object would decref the old value for me since it owns it
-    char date[7]; int id_on_date;
-    parse_event_id(event_id, date, &id_on_date);
-
-    pthread_rwlock_wrlock(&lock);
-    json_t *event = json_array_get(
-        json_object_get(json_object_get(database, calendar_name), date),
-        id_on_date
-    );
-    json_object_del(event, "removed"); // decref's the bool ref to manage memory
-    int rc = json_object_set_new(event, "removed", json_true());
-    pthread_rwlock_unlock(&lock);
-
-    if( rc < 0 ) return "No such event exists on this calendar";
-    return NULL;
-}
-
-char *update_event(json_t *database, pthread_rwlock_t lock, const char *calendar_name, const char *event_id, const char *field, const char *value){
-    char date[7]; int id_on_date;
-    parse_event_id(event_id, date, &id_on_date);
-
-    /*** Validate field and value ***/
-    if( !strcmp(field, "date") ){
-        if( !validate_date(value, NULL, NULL, NULL) ){
-            return "Invalid date (expected 'MMDDYY')";
-        }
-    }
-    else if( !strcmp(field, "time") ){
-        if( !validate_time(value, NULL, NULL) ){
-            return "Invalid time (expected 'HHMM')";
-        }
-    }
-    else if( !strcmp(field, "duration") ){
-        if( !str_to_int(value, NULL) ){
-            return "Invalid duration (expected integer-convertible string)";
-        }
-    }
-    else if( !strcmp(field, "name") || !strcmp(field, "description") || !strcmp(field, "location") ){
-        // Anything is valid
-    }
-    else
-        return "Field is invalid (must be one of: date, time, duration, name, description, location)";
-
-    /*** Perform update ***/
-    pthread_rwlock_wrlock(&lock);
-    json_t *event = json_array_get(
-        json_object_get(json_object_get(database, calendar_name), date),
-        id_on_date
-    );
-    json_object_del(event, field); // decref count of the previous value. May fail if field is optional and was not set previously
-    int rc = json_object_set_new(event, field, json_string(value));
-    pthread_rwlock_unlock(&lock);
-    if( rc < 0 ) return "No such event exists on this calendar";
-    return NULL;
-}
-
-char *get_events_on_date(json_t **results_out, json_t *database, pthread_rwlock_t lock, const char *calendar_name, const char *date){
-    if( !validate_date(date, NULL, NULL, NULL) ){
-        return "Date invalid (expected MMDDYY)";
-    }
-
-    // No need to fetch results if user doesn't want them
-    if( !results_out ) return NULL;
-
-    pthread_rwlock_rdlock(&lock);
-
-    // Getting all events on a date is very easy thanks to our data structure
-    json_t *events_on_date = json_object_get(json_object_get(database, calendar_name), date);
-    // If calendar does not exist (i.e., has no events) or this date does not exist in the calendar (i.e., has no events), return an empty array (signifies no events)
-    if( !events_on_date ) events_on_date = json_array();
-    // However, to account for our 'removed' field, we must filter out removed events before returning the results
-    json_t *results;
-    if( json_array_size(events_on_date) ){
-        results = json_array();
-        json_t *true_obj = json_true();
-        int index; json_t *value;
-        json_array_foreach(events_on_date, index, value){
-            if( !json_equal(json_object_get(value, "removed"), true_obj) ){
-                json_t *event_to_append = json_deep_copy(value);
-                json_object_del(event_to_append, "removed");
-                json_array_append_new(results, event_to_append);
-            }
-        }
-        json_decref(true_obj);
-    }
-    else{
-        // in the case that the event list is empty, we created a new array which we want to embed in the result so that it is decref'd and freed later.
-        results = events_on_date;
-    }
-    pthread_rwlock_unlock(&lock);
-
-    // Wrap in an object to tack on numevents field
-    json_t *to_return = json_object();
-    json_object_set_new(to_return, "numevents", json_integer(json_array_size(results))); // hand over reference
-    json_object_set_new(to_return, "events", results); // hand over reference
-
-    *results_out = to_return; // caller will need to decref to free everything
-
-    return NULL;
-}
-
-
-char *get_events_in_range(json_t **results_out, json_t *database, pthread_rwlock_t lock, const char *calendar_name, const char *start_date, const char *end_date){
-    // Qs:
-    //  - start/stop inclusive or exclusive?
-    //  - what is output format (are all events contained in one object? are events nested into objects depending on the day?)? it includes a numdays field? why? Should it be a map of date to a list of events? Or just an array of arrays of events, where the caller can determine which fall on which day based on order and start date
-    int month, day, year;
-    if( !validate_date(start_date, &month, &day, &year) ){
-        return "Start date invalid (expected MMDDYY)";
-    }
-    int end_month, end_day, end_year;
-    if( !validate_date(end_date, &end_month, &end_day, &end_year) ){
-        return "End date invalid (expected MMDDYY)";
-    }
-    bool start_after_end = (end_year < year) || (end_year == year && end_month < month) || (end_year == year && end_month == month && end_day < day);
-    if( start_after_end ){
-        return "End date precedes start date (expected end date to follow start date)";
-    }
-
-    // No need to fetch results if user doesn't want them
-    if( !results_out ) return NULL;
-
-    // No locking because we just call get_events_on_date which does it for us
-    json_t *date_to_events = json_object();
-    int num_days = 0;
-    // TODO: this setup currently uses an inclusive start and exclsuive stop (as is a common paradigm) - is this ok?
-    for(; !(day == end_day && month == end_month && year == end_year); num_days++ ){
-        char date[7];
-        sprintf(date, "%02d%02d%02d", month, day, year);
-        json_t *events_today;
-        get_events_on_date(&events_today, database, lock, calendar_name, date);
-        json_object_set_new(date_to_events, date, events_today); // hand reference to to_return
-        /*
-        char *events_today_json = json_dumps(events_today, 0);
-        if( !events_today_json ) printf("there was an error printing events_today...\n");
-        printf("setting key %s to %s\n", date, events_today_json);
-        free(events_today_json);
-        */
-
-        // Advance to next day, ignoring leap years
-        day = (day % MONTH_TO_N_DAYS[month]) + 1;
-        bool is_new_month = day == 1;
-        if( is_new_month ) month = (month % 12) + 1;
-        bool is_new_year = is_new_month && month == 1;
-        if( is_new_year ) year = (year % 99) + 1; 
-    }
-
-    json_t *to_return = json_object();
-    json_object_set_new(to_return, "numdays", json_integer(num_days)); // hand reference over
-    json_object_set_new(to_return, "days", date_to_events); // hand reference over
-    *results_out = to_return; // caller will need to decref to free everything
-
-    return NULL;
-}
