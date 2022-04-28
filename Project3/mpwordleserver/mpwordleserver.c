@@ -211,7 +211,7 @@ void usage(char *invoked_as, int exit_code){
         "   -lp X: The main lobby server listens on port X. The default is 4100.\n"
         "   -pp X: The starting play/game port is X. When the lobby capacity is reached, a new game begins on another port, the first being X and incrementing for future games (as availability allows). The default is 4101.\n"
         "   -nr X: Each game includes X rounds. The default is 3.\n"
-        "   -d dictname: Words will be drawn from the file at path 'dictfile'. List each word on a separate line. Words must be between 3 and 10 letters, inclusive. The default dictionary is one we have constructed.\n"
+        "   -d dictfile: Words will be drawn from the file at path 'dictfile'. List each word on a separate line. Words must be between 3 and 10 letters, inclusive. There should NOT be a newline at the end of the file. The default dictionary is a list of past wordle answers.\n"
         "   -dbg: The servers will print debugging information whenever they receive or send a message (it does not by default).\n"
         , invoked_as
     );
@@ -237,6 +237,7 @@ bool process_args(int argc, char **argv){
     longopts[5] = debug_on_opt;
     longopts[6] = sentinel;
 
+    char *dict_filename = "wordle-answers-alphabetical.txt";
     int val, idx;
     while( (val = getopt_long_only(argc, argv, "", longopts, &idx)) > -1 ){
         switch(val){
@@ -269,16 +270,7 @@ bool process_args(int argc, char **argv){
                 }
                 break;
             case 4:
-                DICT_FILE = fopen(optarg, "r");
-                if( !DICT_FILE ){
-                    perror("couldn't open dictionary file");
-                    return false;
-                }
-                int line_err = validate_dictionary(DICT_FILE);
-                if( line_err ){
-                    fprintf(stderr, "[Error] All words in the dictionary file must be 3-10 letters, inclusive, with one word per line and NO newline at the end of the file: line %d of %s does not comply\n", line_err, optarg);
-                    return false;
-                }
+                dict_filename = optarg;
                 break;
             case 5:
                 DEBUG = true;
@@ -293,6 +285,19 @@ bool process_args(int argc, char **argv){
         fprintf(stderr, "[Error] Unrecognized option %s\n", argv[optind]);
         return false;
     }
+
+    // Open and validate dictionary file
+    DICT_FILE = fopen(dict_filename, "r");
+    if( !DICT_FILE ){
+        perror("couldn't open dictionary file");
+        return false;
+    }
+    int line_err = validate_dictionary(DICT_FILE);
+    if( line_err ){
+        fprintf(stderr, "[Error] All words in the dictionary file must be 3-10 letters, inclusive, with one word per line and NO newline at the end of the file: line %d of %s does not comply\n", line_err, optarg);
+        return false;
+    }
+
     return true;
 }
 
