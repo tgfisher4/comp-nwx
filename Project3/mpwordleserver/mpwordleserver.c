@@ -542,6 +542,7 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
             result = json_object();
             json_object_set_new(result, "MessageType", json_string("InvalidRequest"));
             // Set calls incref on value (respecting the caller's reference) so this should be correct.
+            json_object_set_new(result, "Data", json_object());
             json_object_set(result, "Error", request);// json_copy(request));
             //json_object_set_new(result, "Error", json_copy(request));
             // No broadcasts to send in case of invalid request
@@ -575,7 +576,7 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
         json_decref(request);
         json_decref(result);
 
-        // Determine if major change needed
+        // Determine if major change (transition to game or end game) needed
         int n_broadcasts = 0;
         for( ; broadcasts[n_broadcasts]; ++n_broadcasts ) ; // advance n_broadcasts until we hit NULL
         bool was_broadcast_sent = n_broadcasts > 0;
@@ -679,16 +680,15 @@ json_t *lobby_message_handler(json_t *message, int sockfd, struct broadcast_mess
 
     json_t *response = json_object();
     json_object_set_new(response, "Data", json_object());
+    json_object_set_new(response, "MessageType", json_string("InvalidRequest"));
 
     const char *message_type = json_string_value(json_object_get(message, "MessageType"));
     if( !message_type ){
-        json_object_set_new(response, "MessageType", json_string("InvalidRequest"));
         err = "Required string field '.MessageType' is missing or is not a string";
         goto return_error;
     }
     json_t *message_data = json_object_get(message, "Data");
     if( !message_data ){
-        json_object_set_new(response, "MessageType", json_string("InvalidRequest"));
         err = "Required field '.Data' is missing";
         goto return_error;
     }
@@ -787,7 +787,7 @@ json_t *lobby_message_handler(json_t *message, int sockfd, struct broadcast_mess
             (*broadcasts)[0] = start_instance_bcast;
             (*broadcasts)[1] = NULL; // null-terminate the array
         }
-        json_object_set_new(json_object_get(response, "Data"), "Result", json_string("Yes")); // does replacing a value decref the old one?
+        json_object_set_new(json_object_get(response, "Data"), "Result", json_string("Yes"));
         return response;    
     }
     else {
@@ -952,16 +952,15 @@ json_t *game_message_handler(json_t *message, int sockfd, struct broadcast_messa
 
     json_t *response = json_object();
     json_object_set_new(response, "Data", json_object());
+    json_object_set_new(response, "MessageType", json_string("InvalidRequest"));
 
     const char *message_type = json_string_value(json_object_get(message, "MessageType"));
     if( !message_type ){
-        json_object_set_new(response, "MessageType", json_string("InvalidRequest"));
         err = "Required string field '.MessageType' is missing or is not a string";
         goto return_error;
     }
     json_t *message_data = json_object_get(message, "Data");
     if( !message_data ){
-        json_object_set_new(response, "MessageType", json_string("InvalidRequest"));
         err = "Required field '.Data' is missing";
         goto return_error;
     } 
@@ -1010,6 +1009,7 @@ json_t *game_message_handler(json_t *message, int sockfd, struct broadcast_messa
             err = "Expected string field '.Data.Name' is missing or is not a string";
             goto return_error;
         }
+        // Probably optimal to add another reference to the player_name string in the message_data object, but this is only one string and is short-lived: both message and response will be freed at the same time
         json_object_set_new(json_object_get(response, "Data"), "Name", json_string(player_name));
 
         int nonce = json_integer_value(json_object_get(message_data, "Nonce"));
@@ -1103,7 +1103,7 @@ json_t *game_message_handler(json_t *message, int sockfd, struct broadcast_messa
         bool send_end_game = rc == 3;
         int n_broadcasts = send_guess_result + send_end_round + send_start_round + send_prompt_for_guess + send_end_game;
 
-        free(*broadcasts);
+        free(*broadcasts); // free placeholder
         *broadcasts = malloc((n_broadcasts + 1) * sizeof(struct broadcast_message *));
         (*broadcasts)[n_broadcasts] = NULL; // null-terminate
 
@@ -1124,7 +1124,7 @@ json_t *game_message_handler(json_t *message, int sockfd, struct broadcast_messa
                 json_object_set(info_to_append, "Result", json_object_get(info, "LastGuessResult"));
                 // NOTE: Why are we using a string to specify "Yes" and "No": json supports the boolean type, why aren't we using it?
                 was_winner = was_winner || json_object_get(info, "LastGuessCorrect") == json_true();
-                json_object_set(info_to_append, "Correct", json_string(json_object_get(info, "LastGuessCorrect") == json_true() ? "Yes" : "No"));
+                json_object_set_new(info_to_append, "Correct", json_string(json_object_get(info, "LastGuessCorrect") == json_true() ? "Yes" : "No"));
                 json_array_append_new(player_info, info_to_append);
             }
 
@@ -1316,7 +1316,7 @@ char *handle_guess(const char *player_name, const char *guess, int sockfd, int *
     json_array_append_new(json_object_get(json_object_get(player_to_info, player_name), "RoundGuessHistory"), json_string(guess));
     char formatted_time[BUFSIZ];
     sprintf(formatted_time, "%lld.%06lld", (long long) tp.tv_sec, (long long) tp.tv_nsec / 1000); // nano * 10^3 = micro
-    json_object_set(json_object_get(player_to_info, player_name), "LastGuess@", json_string(formatted_time));
+    json_object_set_new(json_object_get(player_to_info, player_name), "LastGuess@", json_string(formatted_time));
     
     // NOTE: could either be
     //  (a) LAZY - do minimum work now: just record answer and wait to process it later when everyone has submitted, or 
