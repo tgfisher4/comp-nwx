@@ -80,8 +80,8 @@ class WordleClient:
 
     def join(self, addr, msg_type, unique_id):
         global skt
-        skt = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        skt.connect(addr)
+        temp_skt = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        temp_skt.connect(addr)
 
         data = {}
         data['Name'] = self.username
@@ -92,7 +92,9 @@ class WordleClient:
         msg = {
                 'MessageType': msg_type, "Data": data
                 }
-        utils.send_nl_message(skt, utils.encode_object(msg)) # do i need to encode?
+        utils.send_nl_message(temp_skt, utils.encode_object(msg)) # do i need to encode?
+        skt = temp_skt
+        self.skt_msgs = utils.nl_socket_messages(skt)
 
     # Source: https://www.programcreek.com/python/example/106575/curses.textpad
     # Need backspace, enter capabilities
@@ -157,35 +159,47 @@ class WordleClient:
         for idx, color in enumerate(self.result):
             if color != 'B':
                 self.stdscr.chgat(1, idx*3, curses.A_BOLD | curses.color_pair(d[color]))
+
+    def cursor_increment(self):
+        # Increment cursor while keeping in bounds
+        self.curr_chatln += 1
+        # Run out of room in pad; delete first line
+        if self.curr_chatln > self.H-5:
+            self.chat_pad.move(0,0)
+            self.chat_pad.deleteln()
+            self.curr_chatln -= 1
     
-    def print_playerInfo(infos):
+    def print_playerInfo(self, infos):
         self.chat_pad.addstr(self.curr_chatln-1, 0, f'-----SCOREBOARD-----')
         for info in infos:
             self.chat_pad.addstr(self.curr_chatln, 0, f'{info["Name"]} (#: {info["Number"]}) has score: {info["Score"]}')
-            self.curr_chatln += 1
+            #self.curr_chatln += 1
+            self.cursor_increment()
         self.chat_pad.addstr(self.curr_chatln, 0, f'--------------------')
     
-    def print_playerInfoResult(infos):
+    def print_playerInfoResult(self, infos):
         self.chat_pad.addstr(self.curr_chatln-1, 0, f'-----SCOREBOARD-----')
         for info in infos:
             s = 'Correct' if info['Correct'] == 'Yes' else 'Incorrect'
             self.chat_pad.addstr(self.curr_chatln, 0, f'{info["Name"]} ({s}, #: {info["Number"]}) sent guess at time {info["ReceiptTime"]} with result: {info["Result"]}')
-            self.curr_chatln += 1
+            #self.curr_chatln += 1
+            self.cursor_increment()
         self.chat_pad.addstr(self.curr_chatln, 0, f'--------------------')
     
-    def print_playerInfoRound(infos): # Because we want to pass ScoreEarned and Winner now
+    def print_playerInfoRound(self, infos): # Because we want to pass ScoreEarned and Winner now
         self.chat_pad.addstr(self.curr_chatln-1, 0, f'-----SCOREBOARD-----')
         for info in infos:
             s = 'Won' if info['Winner'] == 'Yes' else 'Lost'
             self.chat_pad.addstr(self.curr_chatln, 0, f'{info["Name"]} ({s}, #: {info["Number"]}) has earned score: {info["ScoreEarned"]}')
-            self.curr_chatln += 1
+            #self.curr_chatln += 1
+            self.cursor_increment()
         self.chat_pad.addstr(self.curr_chatln, 0, f'--------------------')
 
     def process_msg(self, msg):
         # Basic idea: process based on message type
 
         if msg['MessageType'] == 'JoinResult':
-            print(msg) #NOTE
+            pass
         elif msg['MessageType'] == 'Chat': # Why is the server going to send a msg with "Chat" type?
             player = msg["Data"]["Name"]
             if not player in self.p_to_color:
@@ -202,16 +216,16 @@ class WordleClient:
 
         elif msg['MessageType'] == 'StartGame':
             self.rounds = msg['Data']['Rounds']
-            players = msg['Data']['Players']
+            players = msg['Data']['PlayerInfo']
         
         elif msg['MessageType'] == 'StartRound':
             self.wordLength = msg['Data']['WordLength']
             self.lastGuess = '_'*self.wordLength
             self.result = 'B'*self.wordLength
-            self.showBoard()
+            self.show_board()
             # So many of the fields are duplicates
             self.round = 1
-            print_playerInfo(msg['Data']['PlayerInfo'])
+            self.print_playerInfo(msg['Data']['PlayerInfo'])
         
         elif msg['MessageType'] == 'PromptForGuess':
             # msg in chatlog; tells you round but unneeded
@@ -226,16 +240,16 @@ class WordleClient:
 
         elif msg['MessageType'] == 'GuessResult':
             winner = msg['Data']['Winner']
-            print_playerInfoResult(msg['Data']['PlayerInfo'])
+            self.print_playerInfoResult(msg['Data']['PlayerInfo'])
             # Print new guess with corresponding colors on the board
             self.result = list(filter(lambda item: item['Name'] == self.my_name, msg['Data']['PlayerInfo']))[0]['Result']
 
         elif msg['MessageType'] == 'EndRound':
             self.round += 1
-            print_playerInfoRound(msg['Data']['PlayerInfo'])
+            self.print_playerInfoRound(msg['Data']['PlayerInfo'])
 
         elif msg['MessageType'] == 'EndGame':
-            winner = msg['Data']['Winner']
+            winner = msg['Data']['WinnerName']
             print_playerInfo(msg['Data']['PlayerInfo'])
     
     def render_msgs(self): # receiver thread
@@ -245,22 +259,22 @@ class WordleClient:
             #H = self.chat_win.getmaxyx()[0] -> prob the way I should be doing this
            
             # If send invalid msg need to decrement curr_chatln
-            for msg in utils.nl_socket_messages(skt):
-                # display chat messages/new game state 
-                self.process_msg(json.loads(msg))
+            # for msg in utils.nl_socket_messages(skt):
+            msg = next(self.skt_msgs)
+            print(str(msg), file=sys.stderr)
+            with open('log.txt', mode='a') as f:
+                f.write(str(json.loads(msg)))
+                f.write("\n")
+            # display chat messages/new game state 
+            self.process_msg(json.loads(msg))
 
-                # Flushes to screen
-                self.chat_pad.noutrefresh(max(0, self.curr_chatln-(self.H-6-int(self.H/6))),0,int(self.H/6),0,self.H-6,self.W)
-                #curses.doupdate()
-                #time.sleep(0.1)
-                self.curr_chatln += 1
-                
-                # Run out of room in pad; delete first line
-                if self.curr_chatln > self.H-5:
-                    self.chat_pad.move(0,0)
-                    self.chat_pad.deleteln()
-                    self.curr_chatln -= 1
-    
+            # Flushes to screen
+            self.chat_pad.noutrefresh(max(0, self.curr_chatln-(self.H-6-int(self.H/6))),0,int(self.H/6),0,self.H-6,self.W)
+            #curses.doupdate()
+            #time.sleep(0.1)
+            #self.curr_chatln += 1
+            self.cursor_increment()
+            
     def await_input(self): # sender thread
         # Waits for user to enter a msg and then delivers to server
         
@@ -299,7 +313,7 @@ class WordleClient:
 
 
 def main(stdscr):
-    WordleClient(sys.argv[1], 'student05.cse.nd.edu', 4100, stdscr)
+    WordleClient(sys.argv[1], 'student13.cse.nd.edu', 4100, stdscr)
 
 if __name__ == '__main__':
     curses.wrapper(main)
