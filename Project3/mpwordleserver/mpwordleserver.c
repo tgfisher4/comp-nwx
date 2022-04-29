@@ -512,6 +512,7 @@ void *handle_socket_thread_wrapper(void *arg){
 void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){ // data is global so it can be manipulated by all (could also accept a pointer to it)
     while(true){
         json_t *request = get_next_request(sockfd);
+        printf("[%d] Received a message, ready to grab lock\n", sockfd);
         
         // NOTE: after much thinking about concurrency, I think select/poll makes actually more sense for this project.
         // Consider the following scenario in a 2-player game
@@ -524,6 +525,7 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
         // Of course, the best way to do this would be to use select/poll, where all requests are serialized and processed in order (no concurrency).
         // Since I already started pretty far down the thread route, this implementation will use the global lock to essentially re-implement select/poll since refactoring is not feasible.
         pthread_mutex_lock(&global_lock);
+        printf("[%d] Grabbed lock\n", sockfd);
 
         if( !request ){
             printf("[Info] Connection with client (via socket %d) broken: unable to recv.\n", sockfd);
@@ -531,7 +533,7 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
         }
 
         if( DEBUG ){
-            fprintf(stdout, "[Debug] Received message from socket %d: ", sockfd);
+            fprintf(stdout, "[Debug] Received message from socket %d\n\t", sockfd);
             json_dumpf(request, stdout, 0);
             fprintf(stdout, "\n");
         }
@@ -558,9 +560,11 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
                 break; // send failed, close cxn
             }
         }
+        printf("[%d] Finished sending result\n", sockfd);
 
         json_t *info;
         const char *player_name;
+        printf("[%d] First broadcast points to: %p\n", sockfd, broadcasts[0]);
         for( int msg_idx = 0; broadcasts[msg_idx]; ++msg_idx ){
             struct broadcast_message *msg = broadcasts[msg_idx];
             json_object_foreach(player_to_info, player_name, info){
@@ -570,9 +574,11 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
                     json_object_set_new(json_object_get(msg->message, "Data"), field->name, field->resolver(player_name));
                 }
                 if( !dump_json(json_integer_value(json_object_get(info, "Sockfd")), msg->message) )
-                    printf("Failed to broadcast to %s\n", player_name);// If one of these fails, ignore: let the 'owning' socket handle it when it discovers the socket is down
+                    printf("[%d] Failed to broadcast to %s\n", sockfd, player_name);// If one of these fails, ignore: let the 'owning' socket handle it when it discovers the socket is down
             }
         }
+        printf("[%d] Finished sending broadcasts\n", sockfd);
+
         json_decref(request);
         json_decref(result);
 
@@ -585,10 +591,12 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
         bool was_start_instance_sent = was_broadcast_sent && !strcmp(json_string_value(json_object_get(broadcasts[n_broadcasts - 1]->message, "MessageType")), "StartInstance");
 
         // Free broadcasts
+        printf("[%d] Freeing broadcasts\n", sockfd);
         for( int msg_idx = 0; broadcasts[msg_idx]; ++msg_idx ){
             broadcast_message_destroy(broadcasts[msg_idx]);
         }
         free(broadcasts);
+        printf("[%d] Freed broadcasts\n", sockfd);
 
         // TODO: I think this never actually closes the original socket of the last person to join
         //  - since the game server is short-lived and this is a one-time occurence, there won't be any leaking of memory: should be fine to leave it as is
@@ -597,9 +605,14 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
             close(sockfd);
             transition_to_game();
         }
-        if( was_end_game_sent ) exit(1); // trust OS to free memory, close sockets, etc
+        if( was_end_game_sent ){
+            printf("Exiting...\n");
+            exit(1); // trust OS to free memory, close sockets, etc
+        }
 
+        printf("[%d] Releasing lock\n", sockfd);
         pthread_mutex_unlock(&global_lock);
+        printf("[%d] Ready to loop back\n", sockfd);
     }
 
     // When closing socket, we may want to delete a player's info.
@@ -643,7 +656,7 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
 
 bool dump_json(int sockfd, json_t *json){
     if( DEBUG ){
-        fprintf(stdout, "[Debug] Sending message to socket %d: ", sockfd);
+        fprintf(stdout, "[Debug] Sending message to socket %d\n\t", sockfd);
         json_dumpf(json, stdout, 0);
         fprintf(stdout, "\n");
     }
@@ -745,7 +758,7 @@ json_t *lobby_message_handler(json_t *message, int sockfd, struct broadcast_mess
 
         int port;
         err = handle_join(player_name, sockfd, &port);
-        printf("handle_join port returned: %d\n", port);
+        printf("[%d] handle_join port returned: %d\n",sockfd,port);
         if( err ) goto return_error;
 
 
@@ -763,9 +776,6 @@ json_t *lobby_message_handler(json_t *message, int sockfd, struct broadcast_mess
         // port == 0 ==> not enough players yet: lobby server will not construct broadcast message but will pass through to send response message
         //  - note that upon error, we have already jumped to return_error
         if( port > 0 ){ // new game server: construct broadcast message and pass through to send response message
-            printf("After returning, in port > 0 if");
-            json_dumpf(player_to_info, stdout, 0);
-            printf("\n");
             json_t *start_instance_data = json_object();
             
             char my_host[BUFSIZ];
@@ -841,7 +851,6 @@ char *handle_join(const char *player_name, int sockfd, int *port_out){
     json_object_set_new(player_info, "Nonce", json_integer(rand() % 1000000));
 
     json_object_set_new(player_to_info, player_name, player_info);
-    json_dumpf(player_to_info, stdout, 0);
      
     // We decided to let the OS assign our game port, which we can then read and report to the user - this makes bookeeping easier (none) and accounts for the case that some port shortly following our start_play_port is take
     // If lobby now full, launch new game
@@ -1529,7 +1538,7 @@ char *compute_wordle_result(const char *guess, const char *answer){
 
 
 json_t *get_next_request(int sockfd){
-    static char *buffer = NULL;
+    /*static */char *buffer = NULL;
     if( !buffer ){
         buffer = malloc(BUFSIZ);
     }
@@ -1537,7 +1546,7 @@ json_t *get_next_request(int sockfd){
         fprintf(stderr, "[Error] Memory allocation failed: %s. Aborting...\n", strerror(errno));
         exit(1);
     }
-    static int space_remaining = BUFSIZ; // essentially tracks end of meaningful data in buffer
+    /*static */int space_remaining = BUFSIZ; // essentially tracks end of meaningful data in buffer
     // No reordering necessary when datatype is a single byte: endianness refers ontly to whether most- or least-significant BYTE comes first (its called BYTE order)
     int current_bufsiz_multiple = 1; // resets to 1 on every invocation
     do {
@@ -1557,6 +1566,7 @@ json_t *get_next_request(int sockfd){
         if( newline ){
             // Parse JSON up to newline
             // Parse now so we can throw out the string we parsed from: returning a string might be more general, but would require allocating space for the copied request so we can free the buffer (certainly doable but adds complexity which is unneeded here).
+            printf("[%d] Processing complete msg\n", sockfd);
             json_t *to_return = json_loadb(buffer, newline - buffer, 0, NULL);
             if( !to_return ){
                 to_return = json_string("Invalid request: could not parse as JSON");
@@ -1565,6 +1575,7 @@ json_t *get_next_request(int sockfd){
             // Bookkeep for next time
             // Because we check after every BUFSIZ-sized chunk, we can be sure that any valid data beyond the newline will fit into a BUFSIZ-size buffer
             int n_bytes_to_preserve = space_used - (newline - buffer) - 1; // valid data left in buffer beyond newline: valid - parsed - 1 (newline): < BUFSIZ
+            //printf("[%d] Saving for enx Processing complete msg\n", sockfd);
             char *small_buffer = malloc(BUFSIZ);
             if( !small_buffer ){
                 fprintf(stderr, "[Error] Memory allocation failed: %s. Aborting...\n", strerror(errno));
@@ -1596,7 +1607,9 @@ json_t *get_next_request(int sockfd){
         }
 
         // Receive more data to try to find end of request
+        printf("[%d] ABOUT TO RECV: OFFSET %ld, UP TO %d\n", sockfd, unused_buffer_start - buffer, space_remaining);
         int got = recv(sockfd, unused_buffer_start, space_remaining, 0);
+        printf("[%d] RETURNED FROM RECV: GOT %d\n", sockfd, got);
         if( got < 0 ){
             perror("[Error] Could not receive from client");
             return NULL;
@@ -1605,6 +1618,13 @@ json_t *get_next_request(int sockfd){
             return NULL;
         }
         space_remaining -= got;
+        
+        printf("[%d] BUFFER (length %d, %d remaining) \n\t|%.*s|\n", sockfd, current_bufsiz_multiple * BUFSIZ - space_remaining, space_remaining, current_bufsiz_multiple * BUFSIZ - space_remaining, buffer);
+
+        printf("[%d] BUFFER \n\t|", sockfd);
+        for( int i = 0; i < current_bufsiz_multiple * BUFSIZ - space_remaining; ++i)
+            printf("(%c, %d)", buffer[i], buffer[i]);
+        printf("|\n");
     } while(true);
 }
 
