@@ -1,4 +1,4 @@
-# Project 2
+# Project 3: Multiplayer Wordle
 
 #### Names: Jason Brown, Graham Fisher, Tommy Gallagher
 
