@@ -17,6 +17,7 @@ To learn about available and required options, invoke `cd mpwordle && ./mpwordle
  1) The client is configured to handle `PlayerLeave` messages, letting the user know when another player has left or if they themselves have been kicked out.
  1) The client is configured to handle a `GuessDeadline` field in a `PromptForGuess` message, informing the user of their time limit and setting up a timer display.
  1) The server sends appropriate error messages to the client (error messages outside of `Result`/`Accepted`: `"Yes"`/`"No"` were not mentioned in the project description).
+ 1) Chat messages are colored by player in the client display.
 
 ## Limitations/Assumptions
  - The client assumes the terminal window is sufficiently large (doesn't actually have to be that big, but we recommend full screen).
