@@ -157,6 +157,7 @@ json_t *lobby_message_handler(json_t *message, int sockfd, struct broadcast_mess
 json_t *resolve_info_field(char *field, const char *player_name);
 json_t *resolve_nonce(const char *player_name);
 json_t *resolve_name(const char *player_name);
+json_t *resolve_guess_deadline(const char *player_name);
 char *handle_join(const char *player_name, int sockfd, int *port_out);
 
 void transition_to_game();
@@ -945,6 +946,10 @@ json_t *resolve_name(const char *player_name){
     return resolve_info_field("Name", player_name);
 }
 
+json_t *resolve_guess_deadline(const char *player_name){
+    return resolve_info_field("GuessDeadline", player_name);
+}
+
 char *handle_join(const char *player_name, int sockfd, int *port_out){
     *port_out = 0; // default return value (in case of error or player join but not enough for game)
 
@@ -962,7 +967,7 @@ char *handle_join(const char *player_name, int sockfd, int *port_out){
     json_object_set_new(player_info, "Name", json_string(player_name));
     json_object_set_new(player_info, "Sockfd", json_integer(sockfd));
     json_object_set_new(player_info, "Nonce", json_integer(rand() % 1000000));
-    json_object_set_new(player_info, "Number", json_integer(json_object_size(player_to_info)));
+    json_object_set_new(player_info, "Number", json_integer(1 + json_object_size(player_to_info)));
 
     json_object_set_new(player_to_info, player_name, player_info);
      
@@ -1043,7 +1048,7 @@ char *handle_chat(const char *player_name, int sockfd, const char *text, char **
 
 char *verify_name(const char *player_name, int sockfd){
     if( sockfd != json_integer_value(json_object_get(json_object_get(player_to_info, player_name), "Sockfd")) )
-        return "That's not your name, or you have not yet joined.";
+        return "That's not your name, or you have not yet joined";
     return NULL;
 }
 
@@ -1342,6 +1347,7 @@ json_t *game_message_handler(json_t *message, int sockfd, struct broadcast_messa
                 json_object_set(info_to_append, "Name", json_object_get(info, "Name"));
                 json_object_set(info_to_append, "Number", json_object_get(info, "Number"));
                 json_object_set(info_to_append, "Score", json_object_get(info, "Score"));
+
                 json_array_append_new(player_info, info_to_append);
             }
             json_object_set_new(end_game_message_data, "PlayerInfo", player_info);
@@ -1543,7 +1549,7 @@ char *validate_guess(const char *guess, const char *player_name){
     // If player has already submitted this round, don't let them submit again. 
     // Determine this through the LastGuess@ field.
     if( json_object_get(json_object_get(player_to_info, player_name), "LastGuess@") ){
-        return "You've already submitted your guess. Please wait for other players to submit their guess. You will be notified when all players have submitted and you may submit your next guess.";
+        return "Please wait: you've already submitted your guess, and are waiting for other players to submit their guesses - you will be notified when all players have submitted and you may submit your next guess";
     }
 
     return NULL;
@@ -1656,7 +1662,15 @@ struct broadcast_message *compile_prompt_for_guess_broadcast(){
     json_object_set_new(prompt_for_guess_message, "MessageType", json_string("PromptForGuess"));
     json_t *prompt_for_guess_message_data = json_object(); 
     json_object_set_new(prompt_for_guess_message_data, "WordLength", json_integer(json_string_length(json_object_get(round_info, "Word"))));
-    json_object_set(prompt_for_guess_message_data, "GuessDeadline", json_object_get(round_info, "GuessDeadline"));
+    if( TIMEOUT_SECONDS ){
+        json_object_set(prompt_for_guess_message_data,
+            "GuessDeadline",
+            json_object_get(
+                json_object_iter_value(json_object_iter(player_to_info)),
+                "GuessDeadline"
+            )
+        );
+    }
     // When we are prompting for a guess, we expect that everyone has submitted the last round of guessing, so everything has the same length GuessHistory
     json_object_set_new(prompt_for_guess_message_data, "GuessNumber", json_integer(1 + json_array_size(json_object_get(
         json_object_iter_value(json_object_iter(player_to_info)),
