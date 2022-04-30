@@ -22,10 +22,12 @@ Group: Graham Fisher, Tommy Gallagher, Jason Brown
 #include <time.h>
 #include <getopt.h>
 #include <ctype.h>
+#include <fcntl.h>
 
 #include <jansson.h> // the JSON parsing library we chose to use: https://jansson.readthedocs.io/en/latest | https://github.com/akheron/jansson
 
 #define BACKLOG 10   // how many pending connections queue will hold
+#define max(a, b) ((a) > (b) ? (a) : (b))
 
 /* Data Types */
 // Note: We generally tried to use json_t for data structures as needed since we already have them, and they are very flexible and cover most use cases.
@@ -134,6 +136,7 @@ int N_ROUNDS = 3;
 FILE *DICT_FILE = NULL;
 bool DEBUG = false;
 int N_GUESSES = 6; // not configurable
+int TIMEOUT_SECONDS = 0; // indicates no timeout
 
 /* Prototypes */
 void usage(char *invoked_as, int exit_code);
@@ -146,6 +149,8 @@ void generic_accept_handler(bool is_lobby, int sockfd, message_handler_t handler
 void *handle_socket_thread_wrapper(void *arg);
 void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message);
 bool dump_json(int sockfd, json_t *json);
+void broadcast(struct broadcast_message *msg);
+const char *get_sock_name(int sockfd);
 
 void lobby_accept_handler(int sockfd);
 json_t *lobby_message_handler(json_t *message, int sockfd, struct broadcast_message ***broadcasts);
@@ -160,8 +165,8 @@ char *verify_name(const char *player_name, int sockfd);
 void game_accept_handler(int sockfd);
 json_t *game_message_handler(json_t *message, int sockfd, struct broadcast_message ***broadcasts);
 char *handle_join_instance(const char *player_name, int nonce, int sockfd, bool *start_game_out);
-char *handle_guess(const char *player_name, const char *guess, int sockfd, int *rc);
-char *validate_guess(const char *guess);
+char *handle_guess(const char *player_name, const char *guess, int sockfd, int *rc, bool *player_leave);
+char *validate_guess(const char *guess, const char *player_name);
 int score_round(json_t *round_guess_history);
 void start_next_round();
 char *select_word();
@@ -170,7 +175,7 @@ char *compute_wordle_result(const char *guess, const char *answer);
 
 struct broadcast_message *compile_start_round_broadcast();
 struct broadcast_message *compile_prompt_for_guess_broadcast();
-json_t *get_next_request(int sockfd);
+json_t *get_next_request_r(int sockfd, struct timeval *timeout, void **state_ptr);
 bool str_to_int(const char *str, int *int_out);
 
 
@@ -192,7 +197,6 @@ int main(int argc, char *argv[]){
 
     // Setup
     srand(time(NULL));
-    srand48(time(NULL));
     signal(SIGCHLD, SIG_IGN);
     player_to_info = json_object();
     round_info = json_object();
@@ -213,6 +217,7 @@ void usage(char *invoked_as, int exit_code){
         "   -nr X: Each game includes X rounds. The default is 3.\n"
         "   -d dictfile: Words will be drawn from the file at path 'dictfile'. List each word on a separate line. Words must be between 3 and 10 letters, inclusive. There should NOT be a newline at the end of the file. The default dictionary is a list of past wordle answers.\n"
         "   -dbg: The servers will print debugging information whenever they receive or send a message (it does not by default).\n"
+        "   -to X: The server will allow each client X seconds to guess during each round. If a player does not guess in this time, they are kicked out of the game. X=0 indicates unlimited time for each guess. The default value is 0.\n"
         , invoked_as
     );
     exit(exit_code);
@@ -226,16 +231,18 @@ bool process_args(int argc, char **argv){
     struct option n_rounds_opt = {"nr", required_argument, NULL, 3};
     struct option dict_filename_opt = {"d", required_argument, NULL, 4};
     struct option debug_on_opt = {"dbg", no_argument, NULL, 5};
+    struct option timeout_seconds_opt = {"to", required_argument, NULL, 6};
     struct option sentinel = {0, 0, 0, 0};
 
-    struct option longopts[7];
+    struct option longopts[8];
     longopts[0] = n_players_opt;
     longopts[1] = lobby_port_opt;
     longopts[2] = game_port_start_opt;
     longopts[3] = n_rounds_opt;
     longopts[4] = dict_filename_opt;
     longopts[5] = debug_on_opt;
-    longopts[6] = sentinel;
+    longopts[6] = timeout_seconds_opt;
+    longopts[7] = sentinel;
 
     char *dict_filename = "wordle-answers-alphabetical.txt";
     int val, idx;
@@ -243,29 +250,29 @@ bool process_args(int argc, char **argv){
         switch(val){
             case 0:
                 if( !str_to_int(optarg, &N_PLAYERS_PER_GAME) ){
-                    fprintf(stderr, "option '-np' expects an integer argument");
+                    fprintf(stderr, "option '-np' expects an integer argument.\n");
                     return false;
                 }
                 break;
             case 1:
                 if( !str_to_int(optarg, &LOBBY_PORT) ){
-                    fprintf(stderr, "option '-lp' expects an integer argument");
+                    fprintf(stderr, "option '-lp' expects an integer argument.\n");
                     return false;
                 }
                 if( LOBBY_PORT > 65535 ){
-                    fprintf(stderr, "option '-lp' expects a valid port as argument");
+                    fprintf(stderr, "option '-lp' expects a valid port as argument.\n");
                     return false;
                 }
                 break;
             case 2:
                 if( !str_to_int(optarg, &GAME_PORT_START) ){
-                    fprintf(stderr, "option '-pp' expects an integer argument");
+                    fprintf(stderr, "option '-pp' expects an integer argument.\n");
                     return false;
                 }
                 break;
             case 3:
                 if( !str_to_int(optarg, &N_ROUNDS) ){
-                    fprintf(stderr, "option '-nr' expects an integer argument");
+                    fprintf(stderr, "option '-nr' expects an integer argument.\n");
                     return false;
                 }
                 break;
@@ -274,6 +281,12 @@ bool process_args(int argc, char **argv){
                 break;
             case 5:
                 DEBUG = true;
+                break;
+            case 6:
+                if( !str_to_int(optarg, &TIMEOUT_SECONDS) || TIMEOUT_SECONDS < 0){
+                    fprintf(stderr, "option '-to' expects an non-negative integer argument.\n");
+                    return false;
+                }
                 break;
             default:
                 printf("[INFO] Somehow reached default in process_args switch (val was %d)\n", val);
@@ -294,7 +307,7 @@ bool process_args(int argc, char **argv){
     }
     int line_err = validate_dictionary(DICT_FILE);
     if( line_err ){
-        fprintf(stderr, "[Error] All words in the dictionary file must be 3-10 letters, inclusive, with one word per line and NO newline at the end of the file: line %d of %s does not comply\n", line_err, optarg);
+        fprintf(stderr, "[Error] All words in the dictionary file must be 3-10 letters, inclusive, with one word per line and NO newline at the end of the file: line %d of %s does not comply.\n", line_err, optarg);
         return false;
     }
 
@@ -510,8 +523,19 @@ void *handle_socket_thread_wrapper(void *arg){
 }
 
 void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){ // data is global so it can be manipulated by all (could also accept a pointer to it)
+    void *state = NULL;
     while(true){
-        json_t *request = get_next_request(sockfd);
+        time_t now = time(NULL);
+        const char *player_name = get_sock_name(sockfd);
+        time_t deadline = json_integer_value(json_object_get(json_object_get(player_to_info, player_name), "GuessDeadline"));
+        printf("[%d] %d vs %d\n", sockfd, (int)now, (int)deadline);
+        struct timeval timeout;
+        timeout.tv_usec = 0;
+        json_t *request;
+        // If player does not currently have a deadline set, give them TIMEOUT more time
+        timeout.tv_sec = deadline ? max(deadline - now, 1) : TIMEOUT_SECONDS;
+        printf("[%d] Giving %d more seconds\n", sockfd, (int)timeout.tv_sec);
+        request = get_next_request_r(sockfd, &timeout, &state);
         printf("[%d] Received a message, ready to grab lock\n", sockfd);
         
         // NOTE: after much thinking about concurrency, I think select/poll makes actually more sense for this project.
@@ -526,11 +550,69 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
         // Since I already started pretty far down the thread route, this implementation will use the global lock to essentially re-implement select/poll since refactoring is not feasible.
         pthread_mutex_lock(&global_lock);
         printf("[%d] Grabbed lock\n", sockfd);
+        int leaving = false;
+        json_t *result;
+        struct broadcast_message **broadcasts;
 
-        if( !request ){
-            printf("[Info] Connection with client (via socket %d) broken: unable to recv.\n", sockfd);
-            break;
+        // Recv timed out
+        if( request == json_null() ){
+            printf("[%d] Timed out %d vs %d\n", sockfd, (int)time(NULL), (int)deadline);
+            // If deadline still in the future, recv again until deadline
+            if( is_lobby || !deadline || deadline > time(NULL) ){
+                printf("[%d] Unlocking...\n", sockfd);
+                pthread_mutex_unlock(&global_lock);
+                continue;
+            }
+            // o/w, player has exceeded deadline: expel them
+            leaving = true;
         }
+
+        // Recv failed
+        if( !request ){
+            printf("[%d] Recv failed\n", sockfd);
+            if( is_lobby ){
+                printf("[Info] Connection with client (via socket %d) broken: unable to recv.\n", sockfd);
+                break;
+            }
+
+            // Connection has closed (ignoring the unexpected half-open case), so I would think further writes would fail.
+            // However, for some reason, they don't seem to, and instead block forever.
+            // After some research, it appears this is the situation: the peer closes the connection, and now no one is listening on that port; now, when data is sent to that port, under normal operations we might expect to receive a RST (peer was not expecting data) causing us to close our connection, but some DoS protection prevents us from doing so.
+            // Source: https://stackoverflow.com/questions/7291940/what-may-cause-a-tcp-ip-reset-rst-flag-to-not-be-sent
+            // Still, I might've expected that netcat would, when interrupted, finish the 3-way handshake with peer.
+            // Unless, what's happening is that we DO complete the handshake, but then when I call send again we are attempting to set up another TCP connection? In which case it would expect a connect first, so unsolicited packets are sent RST or, as above, ignored?
+            // Anyway, to get around this, we will set the send timeout to 0 for a connection suspected to have failed, so that we will detect an error immediately and not hang.
+            // Yea, this didn't work either. Follow up with someone smarter to ask wtf going on.
+            // Resorting to sloop boolean to hack it together
+            ///*
+            struct timeval timeout;
+            timeout.tv_sec = 1;
+            timeout.tv_usec = 0;
+            if( setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0 ){    
+                printf("[%d] Send timeout set failed\n", sockfd);
+                exit(1);
+            }
+            printf("[%d] Send timeout set to 0\n", sockfd);
+            leaving = 2;
+        }
+
+        if( leaving ){
+            char *name = strdup(player_name);
+            // Do not include leaving player in future broadcasts or bookkeeping
+            json_object_del(player_to_info, get_sock_name(sockfd));
+            printf("Deleted player info bcast\n");
+
+            // Submit dummy guess for this guess set, to trigger another check of the books so other players can move on if everyone else has submitted
+            // If we have already submitted this round, this will have no effect
+            request = json_object();
+            json_object_set_new(request, "MessageType", json_string("Guess"));
+            json_object_set_new(request, "Data", json_object());
+            json_object_set_new(json_object_get(request, "Data"), "Name", json_string(name));
+            // Special guess value indicating player is leaving
+            json_object_set_new(json_object_get(request, "Data"), "Guess", json_string("$%"));
+            free(name);
+        }
+
 
         if( DEBUG ){
             fprintf(stdout, "[Debug] Received message from socket %d\n\t", sockfd);
@@ -538,8 +620,6 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
             fprintf(stdout, "\n");
         }
 
-        json_t *result;
-        struct broadcast_message **broadcasts;
         if( json_is_string(request) ){ //  if it's a string, it's an error message
             result = json_object();
             json_object_set_new(result, "MessageType", json_string("InvalidRequest"));
@@ -554,28 +634,24 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
             result = handle_message(request, sockfd, &broadcasts);//, database, lock); // maybe?
         }
 
-        if( result ){
-            if( !dump_json(sockfd, result) ){
-                printf("[Info] Connection with client (via socket %d) broken: unable to send.\n", sockfd);
-                break; // send failed, close cxn
-            }
+        // If game mode, want player leaves/diconnects to be discovered by get_next_request (so I can bookkeep via dummy guess), not dump_json
+        // Still want to catch disconnects in lobby here so we don't broadcast startinstance when 
+        // Use hacky boolean to stop from trying to send data to closed socket, which will block forever despite me setting a timeout.
+        if( result && leaving != 2 && !dump_json(sockfd, result) && is_lobby ){
+            printf("[Info] Connection with client (via socket %d) broken: unable to send.\n", sockfd);
+            break; // send failed, close cxn
         }
         printf("[%d] Finished sending result\n", sockfd);
 
-        json_t *info;
-        const char *player_name;
-        printf("[%d] First broadcast points to: %p\n", sockfd, broadcasts[0]);
+        // Once we have sent PlayerLeave to player, good to exit
+        if( !is_lobby && !json_object_size(player_to_info) ){
+            printf("[Info] All players left, exiting...");
+            exit(1);
+        }
+
+        // Broadcast returned messages
         for( int msg_idx = 0; broadcasts[msg_idx]; ++msg_idx ){
-            struct broadcast_message *msg = broadcasts[msg_idx];
-            json_object_foreach(player_to_info, player_name, info){
-                //printf("Broadcasting to %s\n", player_name);
-                for( int field_idx = 0; msg->dynamic_data_fields[field_idx]; ++field_idx ){
-                    struct dynamic_field *field = msg->dynamic_data_fields[field_idx];
-                    json_object_set_new(json_object_get(msg->message, "Data"), field->name, field->resolver(player_name));
-                }
-                if( !dump_json(json_integer_value(json_object_get(info, "Sockfd")), msg->message) )
-                    printf("[%d] Failed to broadcast to %s\n", sockfd, player_name);// If one of these fails, ignore: let the 'owning' socket handle it when it discovers the socket is down
-            }
+            broadcast(broadcasts[msg_idx]);
         }
         printf("[%d] Finished sending broadcasts\n", sockfd);
 
@@ -591,16 +667,13 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
         bool was_start_instance_sent = was_broadcast_sent && !strcmp(json_string_value(json_object_get(broadcasts[n_broadcasts - 1]->message, "MessageType")), "StartInstance");
 
         // Free broadcasts
-        printf("[%d] Freeing broadcasts\n", sockfd);
         for( int msg_idx = 0; broadcasts[msg_idx]; ++msg_idx ){
             broadcast_message_destroy(broadcasts[msg_idx]);
         }
         free(broadcasts);
-        printf("[%d] Freed broadcasts\n", sockfd);
 
-        // TODO: I think this never actually closes the original socket of the last person to join
-        //  - since the game server is short-lived and this is a one-time occurence, there won't be any leaking of memory: should be fine to leave it as is
         if( was_start_instance_sent ){
+            // Since this thread will transform into the accept thread of the game, we won't every discover the socket we previously attended was shutdown, so just close now
             printf("Closing socket %d\n", sockfd);
             close(sockfd);
             transition_to_game();
@@ -609,6 +682,9 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
             printf("Exiting...\n");
             exit(1); // trust OS to free memory, close sockets, etc
         }
+
+        // Wait to break down here so that if player leaves on last guess of game the game server will still exit
+        if( leaving ) break;
 
         printf("[%d] Releasing lock\n", sockfd);
         pthread_mutex_unlock(&global_lock);
@@ -626,20 +702,12 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
     //          - this is slightly annoying because player_to_info is set up to be queried by player_name, not sockfd
     //          - however, since there will likely only ever be a handful of players (and we don't expect players to leave often), a linear search is bearable
     //  Note: There is no problem when clients in the lobby are leaving (one might expect they do not free their info bc lobby seems full) bc info is freed in handle_join
-    const char *player_name;
-    json_t *player_info;
-    void *tmp;
     //  Note: We are sure to lock in case another thread is adding a player to player_to_info (prevent del-check | add add-check start-game | del-info)
-    if( json_object_size(player_to_info) != N_PLAYERS_PER_GAME ){
-        json_object_foreach_safe(player_to_info, tmp, player_name, player_info){ // use 'safe' version since we call delete within loop
-            if( json_integer_value(json_object_get(player_info, "Sockfd")) == sockfd ){
-                json_object_del(player_to_info, player_name);
-                break;
-            }
-        }
+    if( is_lobby && json_object_size(player_to_info) != N_PLAYERS_PER_GAME ){
+        json_object_del(player_to_info, get_sock_name(sockfd));
     }
-    // TODO: extension - if game server, mark client as disconnected
     pthread_mutex_unlock(&global_lock);
+    free(state);
 
     printf("Closing socket %d\n", sockfd);
     close(sockfd);
@@ -654,17 +722,62 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
     // Loop back
 }
 
+const char *get_sock_name(int sockfd){
+    const char *player;
+    json_t *info;
+    json_object_foreach(player_to_info, player, info){
+        if( json_integer_value(json_object_get(info, "Sockfd")) == sockfd ){
+            return player;
+        }
+    }
+    return NULL;
+}
+
 bool dump_json(int sockfd, json_t *json){
     if( DEBUG ){
         fprintf(stdout, "[Debug] Sending message to socket %d\n\t", sockfd);
         json_dumpf(json, stdout, 0);
         fprintf(stdout, "\n");
     }
-    if( json_dumpfd(json, sockfd, JSON_COMPACT) < 0 || send(sockfd, "\n", 1, 0) != 1 ){ // takes care of sending over TCP (streaming) socket
+    
+    ///*
+    struct timeval timeout;
+    socklen_t len = sizeof(timeout);
+    getsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, &len);
+    printf("[%d] Socket has timeout %ds and %dus\n", sockfd, (int)timeout.tv_sec, (int)timeout.tv_usec);
+    //*/
+    /*
+    while( !strcmp(json_string_value(json_object_get(json, "MessageType")), "PlayerLeave")
+            && send(sockfd, "\n", 1, 0) == 1
+    ){
+        printf("[%d] Sent a newline\n", sockfd);
+    }
+    printf("[%d] Sending newline yields %d\n", sockfd, (int)send(sockfd, "\n", 1, 0)); */
+    //alarm(5);
+    char *json_as_str = json_dumps(json, 0);
+    //if( json_dumpfd(json, sockfd, JSON_COMPACT) < 0 || send(sockfd, "\n", 1, 0) != 1 ){ // takes care of sending over TCP (streaming) socket
+    if( send(sockfd, json_as_str, strlen(json_as_str), 0) != strlen(json_as_str) || send(sockfd, "\n", 1, 0) != 1 ){ 
         fprintf(stderr, "[Error] Problem sending result back to client. Aborting connection...\n");
         return false;
     }
+    free(json_as_str);
+    //alarm(0);
+    printf("Send stuff with no problem\n");
     return true;
+}
+
+void broadcast(struct broadcast_message *msg){
+    const char *player;
+    json_t *info;
+    json_object_foreach(player_to_info, player, info){
+        printf("Broadcasting to %s\n", player);
+        for( int field_idx = 0; msg->dynamic_data_fields[field_idx]; ++field_idx ){
+            struct dynamic_field *field = msg->dynamic_data_fields[field_idx];
+            json_object_set_new(json_object_get(msg->message, "Data"), field->name, field->resolver(player));
+        }
+        printf("Resolved dynamic fields for %s\n", player);
+        if( !dump_json(json_integer_value(json_object_get(info, "Sockfd")), msg->message) ) printf("Failed to broadcast to %s\n", player);// If one of these fails, ignore: let the 'owning' socket handle it when it discovers the socket is down
+    }
 }
 
 void lobby_accept_handler(int sockfd){
@@ -849,6 +962,7 @@ char *handle_join(const char *player_name, int sockfd, int *port_out){
     json_object_set_new(player_info, "Name", json_string(player_name));
     json_object_set_new(player_info, "Sockfd", json_integer(sockfd));
     json_object_set_new(player_info, "Nonce", json_integer(rand() % 1000000));
+    json_object_set_new(player_info, "Number", json_integer(json_object_size(player_to_info)));
 
     json_object_set_new(player_to_info, player_name, player_info);
      
@@ -915,6 +1029,7 @@ void transition_to_game(){
     }
     pthread_mutex_unlock(&global_lock);
     // Start new server with slightly different accept handler
+    srand48(time(NULL));
     start_server(NULL, game_accept_socket, game_accept_handler);
 }
 
@@ -1029,11 +1144,13 @@ json_t *game_message_handler(json_t *message, int sockfd, struct broadcast_messa
 
         bool start_game;// = false;
         err = handle_join_instance(player_name, nonce, sockfd, &start_game);
+        printf("Handled joined instance\n");
         if( err ){
             goto return_error;
         }
 
         json_object_set_new(json_object_get(response, "Data"), "Result", json_string("Yes"));
+        json_object_set(json_object_get(response, "Data"), "Number", json_object_get(json_object_get(player_to_info, player_name), "Number"));
 
         if( !start_game ){
             return response;
@@ -1072,11 +1189,12 @@ json_t *game_message_handler(json_t *message, int sockfd, struct broadcast_messa
         (*broadcasts)[2] = prompt_for_guess_broadcast;
         (*broadcasts)[3] = NULL; // null-terminate the array
         
+        printf("Constructed star game broadcasts\n");
         return response;
     }
     else if( !strcmp(message_type, "Guess") ){
         json_object_set_new(response, "MessageType", json_string("GuessResponse"));
-        json_object_set_new(json_object_get(response, "Data"), "Result", json_string("No"));
+        json_object_set_new(json_object_get(response, "Data"), "Accepted", json_string("No"));
 
         const char *player_name = json_string_value(json_object_get(message_data, "Name"));
         if( !player_name ){
@@ -1095,26 +1213,38 @@ json_t *game_message_handler(json_t *message, int sockfd, struct broadcast_messa
         json_object_set_new(json_object_get(response, "Data"), "Guess", json_string(uppercase_guess));
 
         int rc;
-        err = handle_guess(player_name, uppercase_guess, sockfd, &rc);
+        bool player_leave;
+        err = handle_guess(player_name, uppercase_guess, sockfd, &rc, &player_leave);
         free(uppercase_guess);
         printf("Handle guess rc: %d\n", rc);
         if( err ){
             goto return_error;
         }
 
-        json_object_set_new(json_object_get(response, "Data"), "Result", json_string("Yes"));
+        json_object_set_new(json_object_get(response, "Data"), "Accepted", json_string("Yes"));
 
         // See handle_guess for rc values and meanings
+        bool send_player_leave = player_leave;
         bool send_guess_result = rc >= 1;
         bool send_end_round = rc >= 2;
         bool send_start_round = rc == 2;
         bool send_prompt_for_guess = (rc == 1 || rc == 2);
         bool send_end_game = rc == 3;
-        int n_broadcasts = send_guess_result + send_end_round + send_start_round + send_prompt_for_guess + send_end_game;
+        int n_broadcasts = send_player_leave + send_guess_result + send_end_round + send_start_round + send_prompt_for_guess + send_end_game;
 
         free(*broadcasts); // free placeholder
         *broadcasts = malloc((n_broadcasts + 1) * sizeof(struct broadcast_message *));
         (*broadcasts)[n_broadcasts] = NULL; // null-terminate
+
+        if( send_player_leave ){
+            json_t *player_leave_message = json_object();
+            json_object_set_new(player_leave_message, "MessageType", json_string("PlayerLeave"));
+            json_object_set_new(player_leave_message, "Data", json_object());
+            json_object_set_new(json_object_get(player_leave_message, "Data"), "Name", json_string(player_name));
+            struct broadcast_message *player_leave_broadcast = broadcast_message_create(player_leave_message, NULL);
+            // When present, always first
+            (*broadcasts)[0] = player_leave_broadcast;
+        }
 
         // Last guess of set - send GuessResult
         if( send_guess_result ){
@@ -1125,6 +1255,18 @@ json_t *game_message_handler(json_t *message, int sockfd, struct broadcast_messa
 
             bool was_winner = false;
             json_object_foreach(player_to_info, player, info){
+            /*
+
+                // If player is leaving, don't include their result
+                if( !strcmp("$%", json_string_value(json_array_get(
+                        json_object_get(info, "RoundGuessHistory"),
+                        json_array_size(json_object_get(info, "RoundGuessHistory") - 1
+                )))) ){
+                    continue;
+                }
+                */
+
+                json_t *last_guess_correct = json_object_get(info, "LastGuessCorrect");
                 json_t *info_to_append = json_object();
                 // Don't steal references, share them
                 json_object_set(info_to_append, "Name", json_object_get(info, "Name"));
@@ -1132,8 +1274,8 @@ json_t *game_message_handler(json_t *message, int sockfd, struct broadcast_messa
                 json_object_set(info_to_append, "ReceiptTime", json_object_get(info, "LastGuess@"));
                 json_object_set(info_to_append, "Result", json_object_get(info, "LastGuessResult"));
                 // NOTE: Why are we using a string to specify "Yes" and "No": json supports the boolean type, why aren't we using it?
-                was_winner = was_winner || json_object_get(info, "LastGuessCorrect") == json_true();
-                json_object_set_new(info_to_append, "Correct", json_string(json_object_get(info, "LastGuessCorrect") == json_true() ? "Yes" : "No"));
+                was_winner = was_winner || last_guess_correct == json_true();
+                json_object_set_new(info_to_append, "Correct", json_string(last_guess_correct == json_true() ? "Yes" : "No"));
                 json_array_append_new(player_info, info_to_append);
             }
 
@@ -1141,8 +1283,8 @@ json_t *game_message_handler(json_t *message, int sockfd, struct broadcast_messa
             json_object_set_new(guess_result_message_data, "Winner", json_string(was_winner ? "Yes" : "No"));
             json_object_set_new(guess_result_message, "Data", guess_result_message_data);
             struct broadcast_message *guess_result_broadcast = broadcast_message_create(guess_result_message, NULL);
-            // When present, always first
-            (*broadcasts)[0] = guess_result_broadcast;
+            // When present, comes after player_leave (if present)
+            (*broadcasts)[send_player_leave] = guess_result_broadcast;
         }
 
         // Last guess set of round - send EndRound
@@ -1171,20 +1313,20 @@ json_t *game_message_handler(json_t *message, int sockfd, struct broadcast_messa
             json_object_set_new(end_round_message, "Data", end_round_message_data);
 
             struct broadcast_message *end_round_broadcast = broadcast_message_create(end_round_message, NULL);
-            // When present, always second
-            (*broadcasts)[1] = end_round_broadcast;
+            // When present, comes after GuessResult (if present)
+            (*broadcasts)[1 + send_player_leave] = end_round_broadcast;
         }
 
         // More rounds to play - send StartRound
         if( send_start_round ){
-            // When present, always third
-            (*broadcasts)[2] = compile_start_round_broadcast();
+            // When present, comes after EndRound
+            (*broadcasts)[2 + send_player_leave] = compile_start_round_broadcast();
         }
 
         // New guess set - send PromptForGuess
         if( send_prompt_for_guess ){
             // When present, always last
-            (*broadcasts)[n_broadcasts - 1] = compile_prompt_for_guess_broadcast(); 
+            (*broadcasts)[n_broadcasts - 1] = compile_prompt_for_guess_broadcast();
         }
 
         // Last round of game - send EndGame
@@ -1207,8 +1349,16 @@ json_t *game_message_handler(json_t *message, int sockfd, struct broadcast_messa
             json_object_set_new(end_game_message, "Data", end_game_message_data);
 
             struct broadcast_message *end_game_broadcast = broadcast_message_create(end_game_message, NULL);
-            // When present, always third
-            (*broadcasts)[2] = end_game_broadcast;
+            // When present, comes last
+            (*broadcasts)[n_broadcasts - 1] = end_game_broadcast;
+        }
+
+        // Return a leave message instead of the normal response
+        if( send_player_leave ){
+            json_decref(response);
+            json_t *player_leave_message = (*broadcasts)[0]->message;
+            json_incref(player_leave_message);
+            return player_leave_message;
         }
 
         return response;
@@ -1239,8 +1389,6 @@ json_t *game_message_handler(json_t *message, int sockfd, struct broadcast_messa
 }
 
 char *handle_join_instance(const char *player_name, int nonce, int sockfd, bool *start_game_out){
-    static int next_player_number = 0;
-
     json_t *player_info = json_object_get(player_to_info, player_name);
     if( !player_info ){
         return "No such player exists";
@@ -1270,9 +1418,10 @@ char *handle_join_instance(const char *player_name, int nonce, int sockfd, bool 
         json_object_set_new(player_info, "RoundGuessHistory", json_array());
     }
     // If player is reconnecting, reuse their previously assigned number
+    /*
     if( !json_object_get(player_info, "Number") ){
-        json_object_set_new(player_info, "Number", json_integer(next_player_number++));
     }
+    */
 
     // TODO: if reconnecting, need some way to check to not trigger start_game_broadcasts to everyone?
     // - would be interesting if I could send the stat game broadcast sequence to JUST the reconnecting player
@@ -1290,65 +1439,77 @@ char *handle_join_instance(const char *player_name, int nonce, int sockfd, bool 
 
     if( *start_game_out ){
         start_next_round(); // starts round 1
+        json_t *deadline = json_integer(
+                TIMEOUT_SECONDS ? time(NULL) + TIMEOUT_SECONDS : 0
+        );
+        const char *player;
+        json_t *info;
+        // Start guess 1 timer
+        json_object_foreach(player_to_info, player, info){
+            json_object_set(info, "GuessDeadline", deadline);
+        }
+        printf("Set deadline to %d\n", (int)json_integer_value(deadline));
+        json_decref(deadline);
     }
 
     return NULL;
 }
 
-char *handle_guess(const char *player_name, const char *guess, int sockfd, int *rc){
-    struct timespec tp;
-    clock_gettime(CLOCK_REALTIME, &tp);
-    // Verify name
-    char *err = verify_name(player_name, sockfd);
-    if( err ) return err;
+char *handle_guess(const char *player_name, const char *guess, int sockfd, int *rc, bool *player_leave){
+    *player_leave = !strcmp(guess, "$%");
+    // If player left, don't bookkeep their nonexistant records, just check again if we've reached end of round now that this player's records are gone
+    if( !*player_leave ){
+        struct timespec tp;
+        clock_gettime(CLOCK_REALTIME, &tp);
+        // Verify name
+        char *err = verify_name(player_name, sockfd);
+        if( err ) return err;
 
-    // Validate guess
-    err = validate_guess(guess);
-    if( err ) return err;
+        // Validate guess
+        err = validate_guess(guess, player_name);
+        if( err ) return err;
 
-    // Ensure we don't get too far ahead
-    bool guess_set_finished = true;
-    int n_player_guesses = json_array_size(json_object_get(json_object_get(player_to_info, player_name), "RoundGuessHistory"));
-    const char *player;
-    json_t *info;
-    json_object_foreach(player_to_info, player, info){
-        // It is possible you'll get one guess ahead of another player, but if you're already ahead you shouldn't be able to record another guess
-        if( json_array_size(json_object_get(info, "RoundGuessHistory")) < n_player_guesses )
-            return "You've already submitted your guess. Please wait for other players to submit their guess. You will be notified when all players have submitted and you may submit your next guess.";
-        // Yours is the last guess of this guess set if everyone has more guesses than you: one equality is a witness you are not (excluding yourself, of course)
-        if( (json_array_size(json_object_get(info, "RoundGuessHistory")) == n_player_guesses) && json_integer_value(json_object_get(info, "Sockfd")) != sockfd )
-            guess_set_finished = false;
-    }
-    *rc = guess_set_finished;
-
-    // Record guess
-    json_array_append_new(json_object_get(json_object_get(player_to_info, player_name), "RoundGuessHistory"), json_string(guess));
-    char formatted_time[BUFSIZ];
-    sprintf(formatted_time, "%lld.%06lld", (long long) tp.tv_sec, (long long) tp.tv_nsec / 1000); // nano * 10^3 = micro
-    json_object_set_new(json_object_get(player_to_info, player_name), "LastGuess@", json_string(formatted_time));
+        // Record guess
+        json_t *info = json_object_get(player_to_info, player_name);
+        json_array_append_new(json_object_get(info, "RoundGuessHistory"), json_string(guess));
+        char formatted_time[BUFSIZ];
+        sprintf(formatted_time, "%lld.%06lld", (long long) tp.tv_sec, (long long) tp.tv_nsec / 1000); // nano * 10^3 = micro
+        json_object_set_new(info, "LastGuess@", json_string(formatted_time));
+        json_object_set_new(info, "GuessDeadline", json_integer(0));
     
     // NOTE: could either be
     //  (a) LAZY - do minimum work now: just record answer and wait to process it later when everyone has submitted, or 
     //  (b) EAGER - do processing of this answer now, potentially eating up CPU time that could be spent helping someone else submit their answer
     // Conclusion: better to be EAGER here because we expect that players will be submitting at different times, so this gives the server something to do when it might otherwise be idle.
-    char *guess_result = compute_wordle_result(guess, json_string_value(json_object_get(round_info, "Word")));
-    json_object_set_new(json_object_get(player_to_info, player_name), "LastGuessResult", json_string(guess_result));
-    free(guess_result);
+        char *guess_result = compute_wordle_result(guess, json_string_value(json_object_get(round_info, "Word")));
+        bool guess_correct = strspn(guess_result, "G") == strlen(guess_result);
+        json_object_set_new(info, "LastGuessResult", json_string(guess_result));
+        json_object_set_new(info, "LastGuessCorrect", json_boolean(guess_correct));
+        free(guess_result);
+    }
 
     // Check other players' statuses to set rc
     // Note: It was easy to check if all players have submitted this guess: just check if everyone has submitted the same number as me.
     //       It is a bit harder to check if game is over: have to check if any guess correct or have number of guesses reached. We also have to check whether someone won later, anyway.
     // With that said, however, we should perform these computations now because handle_guess is the game-state hook here.
     // That is, we don't want any other calls in the dispatcher altering or examining the game state, we want to encapsulate knowledge of the game state here and simply place the info needed by clt in a 'model' (certain fields of the game state). Also, we need to check if we should call start_next_round bc that call needs to be here.
+    *rc = 1;
+    const char *player;
+    json_t *info;
+    // A guess set is complete if all players have submitted a guess, which we hackily determine through the LastGuess@ field: we reset this when sending GuessResult.
+    json_object_foreach(player_to_info, player, info){
+        if( !json_object_get(info, "LastGuess@") )
+            *rc = 0;
+    }
     if( *rc == 1 ){
-        bool last_guess_set_end = json_array_size(json_object_get(json_object_iter_value(json_object_iter(player_to_info)), "RoundGuessHistory")) == N_GUESSES;
+        int n_guesses = json_array_size(json_object_get(
+                json_object_iter_value(json_object_iter(player_to_info)),
+                "RoundGuessHistory"
+        ));
+        bool last_guess_set_end = n_guesses == N_GUESSES;
         bool winner_end = false;
         json_object_foreach(player_to_info, player, info){
-            bool guess_correct = strspn(json_string_value(json_object_get(info, "LastGuessResult")), "G") == json_string_length(json_object_get(round_info, "Word"));
-            if( guess_correct ){
-                winner_end = true;
-            }
-            json_object_set_new(info, "LastGuessCorrect", json_boolean(guess_correct));
+            winner_end = winner_end || json_object_get(info, "LastGuessCorrect") == json_true();
         }
         bool round_end = last_guess_set_end || winner_end;
         if( round_end ) start_next_round();
@@ -1358,12 +1519,31 @@ char *handle_guess(const char *player_name, const char *guess, int sockfd, int *
         bool game_end = json_integer_value(json_object_get(round_info, "RoundNumber")) > N_ROUNDS;
         *rc += game_end;
     }
+    if( *rc >= 1 ){
+        json_t *deadline = json_integer(
+                TIMEOUT_SECONDS ? time(NULL) + TIMEOUT_SECONDS : 0
+        );
+        const char *player;
+        json_t *info;
+        json_object_foreach(player_to_info, player, info){
+            json_object_set(info, "GuessDeadline", deadline);
+            json_object_del(info, "LastGuess@");
+        }
+        printf("Set deadline to %d\n", (int)json_integer_value(deadline));
+        json_decref(deadline);
+    }
     return NULL;
 }
 
-char *validate_guess(const char *guess){
+char *validate_guess(const char *guess, const char *player_name){
     if( strlen(guess) != json_string_length(json_object_get(round_info, "Word")) ){
         return "Your guess is the wrong length";
+    }
+
+    // If player has already submitted this round, don't let them submit again. 
+    // Determine this through the LastGuess@ field.
+    if( json_object_get(json_object_get(player_to_info, player_name), "LastGuess@") ){
+        return "You've already submitted your guess. Please wait for other players to submit their guess. You will be notified when all players have submitted and you may submit your next guess.";
     }
 
     return NULL;
@@ -1435,7 +1615,7 @@ char *select_word(){
 }
 
 const char *get_game_winner(){
-    const char *curr_arg_max = NULL;
+    const char *curr_arg_max = json_string_value(json_object_get(json_object_iter_value(json_object_iter(player_to_info)), "Name"));
     const char *player;
     json_t *info;
     json_object_foreach(player_to_info, player, info){
@@ -1476,6 +1656,7 @@ struct broadcast_message *compile_prompt_for_guess_broadcast(){
     json_object_set_new(prompt_for_guess_message, "MessageType", json_string("PromptForGuess"));
     json_t *prompt_for_guess_message_data = json_object(); 
     json_object_set_new(prompt_for_guess_message_data, "WordLength", json_integer(json_string_length(json_object_get(round_info, "Word"))));
+    json_object_set(prompt_for_guess_message_data, "GuessDeadline", json_object_get(round_info, "GuessDeadline"));
     // When we are prompting for a guess, we expect that everyone has submitted the last round of guessing, so everything has the same length GuessHistory
     json_object_set_new(prompt_for_guess_message_data, "GuessNumber", json_integer(1 + json_array_size(json_object_get(
         json_object_iter_value(json_object_iter(player_to_info)),
@@ -1536,29 +1717,36 @@ char *compute_wordle_result(const char *guess, const char *answer){
     return result;
 }
 
+// Double pointer to state so we can read/write it.
+// *state MUST be initialized to NULL on first invocation.
+json_t *get_next_request_r(int sockfd, struct timeval *timeout, void **state_ptr){
+    if( !*state_ptr ){
+        *state_ptr = malloc(sizeof(char *) + sizeof(int));
+        if( !*state_ptr ){
+            fprintf(stderr, "[Error] Memory allocation failed: %s. Aborting...\n", strerror(errno));
+            exit(1);
+        }
 
-json_t *get_next_request(int sockfd){
-    /*static */char *buffer = NULL;
-    if( !buffer ){
-        buffer = malloc(BUFSIZ);
+        *(char **)*state_ptr = malloc(BUFSIZ);
+        if( !*(char **)*state_ptr  ){
+            fprintf(stderr, "[Error] Memory allocation failed: %s. Aborting...\n", strerror(errno));
+            exit(1);
+        }
+        *(int *)((char **)*state_ptr + 1) = BUFSIZ;
     }
-    if( !buffer ){
-        fprintf(stderr, "[Error] Memory allocation failed: %s. Aborting...\n", strerror(errno));
-        exit(1);
-    }
-    /*static */int space_remaining = BUFSIZ; // essentially tracks end of meaningful data in buffer
+
+    char *buffer;
+    int space_remaining; // essentially tracks end of meaningful data in buffer
+    // Recover state from opaque pointer.
+    // State format: state --> |char * buffer|int space_remaining|
+    buffer = *(char **)*state_ptr; // Pretend its a char **
+    space_remaining = *(int *)((char **)*state_ptr + 1); // Pretend its char **, go to next char *, pretend its int * instead, and deref
+
     // No reordering necessary when datatype is a single byte: endianness refers ontly to whether most- or least-significant BYTE comes first (its called BYTE order)
     int current_bufsiz_multiple = 1; // resets to 1 on every invocation
     do {
         int space_used = current_bufsiz_multiple * BUFSIZ - space_remaining;
         char *unused_buffer_start = buffer + space_used;
-        /*
-        printf("[Debug] %d of %d bytes remaining in buffer\n", space_remaining, current_bufsiz_multiple * BUFSIZ);
-        char *print_buffer = malloc(space_used + 1);
-        snprintf(print_buffer, space_used + 1, "%s", buffer);
-        printf("[Debug] Start of buffer|%s|End of buffer\n", print_buffer);
-        free(print_buffer);
-        */
 
         // If the valid portion of the buffer contains a newline, the next request fits in the current buffer.
         // Parse request and save reference in buffer so we can pick up from here next time (in case we received 2 full requests at once)
@@ -1566,7 +1754,6 @@ json_t *get_next_request(int sockfd){
         if( newline ){
             // Parse JSON up to newline
             // Parse now so we can throw out the string we parsed from: returning a string might be more general, but would require allocating space for the copied request so we can free the buffer (certainly doable but adds complexity which is unneeded here).
-            printf("[%d] Processing complete msg\n", sockfd);
             json_t *to_return = json_loadb(buffer, newline - buffer, 0, NULL);
             if( !to_return ){
                 to_return = json_string("Invalid request: could not parse as JSON");
@@ -1575,7 +1762,6 @@ json_t *get_next_request(int sockfd){
             // Bookkeep for next time
             // Because we check after every BUFSIZ-sized chunk, we can be sure that any valid data beyond the newline will fit into a BUFSIZ-size buffer
             int n_bytes_to_preserve = space_used - (newline - buffer) - 1; // valid data left in buffer beyond newline: valid - parsed - 1 (newline): < BUFSIZ
-            //printf("[%d] Saving for enx Processing complete msg\n", sockfd);
             char *small_buffer = malloc(BUFSIZ);
             if( !small_buffer ){
                 fprintf(stderr, "[Error] Memory allocation failed: %s. Aborting...\n", strerror(errno));
@@ -1585,13 +1771,11 @@ json_t *get_next_request(int sockfd){
             free(buffer); // release space after each request: if we keep adding onto same buffer we will consume lots of memory we aren't using
             buffer = small_buffer;
             space_remaining = BUFSIZ - n_bytes_to_preserve; // everything beyond what we will preserve is free buffer space
-            /*
-            printf("[Debug] Preserving %d characters, so that there is %d space remaining in the buffer (we expect %d = %d + %d)\n", n_bytes_to_preserve, space_remaining, BUFSIZ, n_bytes_to_preserve, space_remaining);
-            char *preserved_contents = malloc(n_bytes_to_preserve + 1);
-            snprintf(preserved_contents, n_bytes_to_preserve+1, "%s", buffer);
-            printf("[Debug] Preserved buffer contents: START|%s|END\n", preserved_contents);
-            free(preserved_contents);
-            */
+
+            // Pack state into opaque pointer
+            *(char **)*state_ptr = buffer;
+            *(int *)((char **)*state_ptr + 1) = space_remaining;
+
             return to_return;
         }
 
@@ -1608,9 +1792,19 @@ json_t *get_next_request(int sockfd){
 
         // Receive more data to try to find end of request
         printf("[%d] ABOUT TO RECV: OFFSET %ld, UP TO %d\n", sockfd, unused_buffer_start - buffer, space_remaining);
+        // If timeout NULL, set timeout to 0, which causes recv to never timeout
+        struct timeval tv;
+        if( timeout ) tv = *timeout;
+        else {
+            tv.tv_sec = 0;
+            tv.tv_usec = 0;
+        }
+        setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+         
         int got = recv(sockfd, unused_buffer_start, space_remaining, 0);
         printf("[%d] RETURNED FROM RECV: GOT %d\n", sockfd, got);
         if( got < 0 ){
+            if( errno == EAGAIN || errno == EWOULDBLOCK ) return json_null();
             perror("[Error] Could not receive from client");
             return NULL;
         }
