@@ -2,6 +2,8 @@
 
 #### Names: Jason Brown, Graham Fisher, Tommy Gallagher
 
+![A screenshot of the game played by a single player for a single round](./WordleSC.png)
+
 To compile the code, run `make` in the Project3 directory (this may take a second as it downloads the c json processing library we used).
 
 To run the server, run `cd mpwordleserver && ./mpwordleserver [options]` (from the Project3 directory).
