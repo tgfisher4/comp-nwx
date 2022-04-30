@@ -24,7 +24,7 @@ def nl_file_messages(from_file):
 
 def nl_socket_messages(from_skt):
     ''' Receives a newline delimited message from a socket. '''
-    yield from nl_messages(lambda: print("calling recv") or from_skt.recv(BUFSIZ))
+    yield from nl_messages(lambda: from_skt.recv(BUFSIZ))
     #print(type(rlt))
     #return rlt
 
