@@ -66,7 +66,7 @@ struct handle_socket_thread_wrapper_arg{
 // That is, it allows the dynamic_fields passed to live only as long as it does (this is assumed to be a service to the caller so they don't have to maintain handles to the dynamic fields).
 struct broadcast_message *broadcast_message_create(json_t *message, ...){
     struct broadcast_message *to_return = malloc(sizeof(struct broadcast_message));
-    // TODO: am I fail-checking mallocs? very unlikely and not really any recourse
+    // NOTE: we decided not to drive ourselves insane on this assignment by fail-checking every mallocs: failure is very unlikely and not really any recourse to take
 
     // Note: NOT incref'ing the message effectively steals the reference: otherwise, we would want to incref since the caller has a reference and we are saving another.
     to_return->message = message;
@@ -185,8 +185,20 @@ bool str_to_int(const char *str, int *int_out);
  *          Client should have separate thread to listen to async server messages to record chat messages or begin next guess/round
  *
  *          Global lock upon receiving a message to forward to other players has the advantage of providing a universal serialization point for all messages
- *              - since we are sending over a TCP stream, there should be no worry of reordering in-flight: if 'send's succeed, they will be recv'd in that order
  */
+
+/* Locking scheme: 
+         After much thinking about concurrency, I think select/poll makes actually more sense for this project.
+         Consider the following scenario in a 2-player game
+          1) Player 1 submits guess: p1 thread processes it without issue.
+          2) Player 2 submits guess: p2 locks, records guess in global, unlocks
+          3) Player 1 submits unsolicited guess (assuming the worst): suppose p1 thread then grabs the lock (BEFORE p2 can grab it to run start_next_round), sees p1 and p2 have same number of guesses, assesses p1's guess against the WRONG reference word - the next word to be chosen by start_next_round may have a different number of letters.
+         This and other cases (involving when to evaluate whether a round is over, when to evaluate the next guess number) show that, in general, my critical sections are pretty much the ENTIRE processing of a response: perhaps I could use more complex global variables with my lock to try to keep threads from interfering with one another, but the goal of this work would pretty much be to serialize 'Guess' messages.
+         But then, when some functions are expecting the caller to hold the lock and some are not, things get messier.
+         At the very least, it is simplest to serialize ALL messages, and with very small games such as these this should not incur any measurable performance penalty
+         Of course, the best way to do this would be to use select/poll, where all requests are serialized and processed in order (no concurrency).
+         Since I already started pretty far down the thread route, this implementation will use the global lock to essentially re-implement select/poll since refactoring is not feasible.
+*/
 
 /* Functions */
 int main(int argc, char *argv[]){
@@ -350,11 +362,6 @@ int bind_server_socket(char *port){
         sa.sin_port = htons(0);
         sa.sin_addr.s_addr = INADDR_ANY;
 
-        /*
-        char hostname[INET_ADDRSTRLEN];
-        gethostname(hostname, INET_ADDRSTRLEN);
-        inet_pton(AF_INET, hostname, &sa.sin_addr.s_addr);
-        */
         bind(sockfd, (struct sockaddr *)&sa, sizeof(sa));
 
         return sockfd;
@@ -400,59 +407,13 @@ int bind_server_socket(char *port){
 }
 
 /* Transform this process into a server */
-void start_server(char *port, int bound_server_socket, void (*accept_handler)(int sockfd)){//, message_handler){
+void start_server(char *port, int bound_server_socket, void (*accept_handler)(int sockfd)){
     int sockfd, new_fd;  // listen on sock_fd, new connection on new_fd
-    //struct addrinfo hints, *servinfo, *p;
     struct sockaddr_storage their_addr; // connector's address information
     socklen_t sin_size;
-    //int yes=1;
     char s[INET6_ADDRSTRLEN];
-    //int rv;
 
     sockfd = bound_server_socket ? bound_server_socket : bind_server_socket(port);
-
-    /*
-    memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = AI_PASSIVE; // use my IP
-
-    // Get info on own addr
-    if ((rv = getaddrinfo(NULL, port, &hints, &servinfo)) != 0) {
-        fprintf(stderr, "[Error] Failed to getaddrinfo: %s\n", gai_strerror(rv));
-        return 1;
-    }
-
-    // Loop through all the results and bind to the first we can
-    for(p = servinfo; p != NULL; p = p->ai_next) {
-        if ((sockfd = socket(p->ai_family, p->ai_socktype,
-                p->ai_protocol)) == -1) {
-            perror("[Error] Failed to create socket");
-            continue;
-        }
-
-        if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &yes,
-                sizeof(int)) == -1) {
-            perror("[Error] Failed to setsockopt");
-            exit(1);
-        }
-
-        if (bind(sockfd, p->ai_addr, p->ai_addrlen) == -1) {
-            close(sockfd);
-            perror("[Error] Failed to bind a socket");
-            continue;
-        }
-
-        break;
-    }
-
-    freeaddrinfo(servinfo); // all done with this structure
-
-    if (p == NULL)  {
-        fprintf(stderr, "[Error] Failed to bind any socket");
-        exit(1);
-    }
-    */
 
     if (listen(sockfd, BACKLOG) == -1) {
         perror("[Error] Failed to listen");
@@ -468,10 +429,6 @@ void start_server(char *port, int bound_server_socket, void (*accept_handler)(in
 
     char addr[INET_ADDRSTRLEN];
     inet_ntop(sa.sin_family, get_in_addr((struct sockaddr *)&(sa.sin_addr)), addr, sizeof(addr));
-    /* inet_ntop(their_addr.ss_family,
-            get_in_addr((struct sockaddr *)&their_addr),
-            s, sizeof s);
-    */
     printf("[Info] Listening on %s:%d. Waiting for connections...\n", addr, ntohs(sa.sin_port));
 
     while(1) {  // main accept() loop
@@ -506,7 +463,6 @@ void *get_in_addr(struct sockaddr *sa)
 void generic_accept_handler(bool is_lobby, int sockfd, message_handler_t handler){
     // Note: this allocation will be freed at the end of the thread rountine.
     struct handle_socket_thread_wrapper_arg *arg = malloc(sizeof(struct handle_socket_thread_wrapper_arg));
-    // TODO: err check?
     arg->is_lobby = is_lobby;
     arg->sockfd = sockfd;
     arg->handler = handler;
@@ -529,38 +485,22 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
         time_t now = time(NULL);
         const char *player_name = get_sock_name(sockfd);
         time_t deadline = json_integer_value(json_object_get(json_object_get(player_to_info, player_name), "GuessDeadline"));
-        //printf("[%d] %d vs %d\n", sockfd, (int)now, (int)deadline);
         struct timeval timeout;
         timeout.tv_usec = 0;
         json_t *request;
         // If player does not currently have a deadline set, give them TIMEOUT more time
         timeout.tv_sec = deadline ? max(deadline - now, 1) : TIMEOUT_SECONDS;
-        //printf("[%d] Giving %d more seconds\n", sockfd, (int)timeout.tv_sec);
         request = get_next_request_r(sockfd, &timeout, &state);
-        //printf("[%d] Received a message, ready to grab lock\n", sockfd);
         
-        // NOTE: after much thinking about concurrency, I think select/poll makes actually more sense for this project.
-        // Consider the following scenario in a 2-player game
-        //  1) Player 1 submits guess: p1 thread processes it without issue.
-        //  2) Player 2 submits guess: p2 locks, records guess in global, unlocks
-        //  3) Player 1 submits unsolicited guess (assuming the worst): suppose p1 thread then grabs the lock (BEFORE p2 can grab it to run start_next_round), sees p1 and p2 have same number of guesses, assesses p1's guess against the WRONG reference word - the next word to be chosen by start_next_round may have a different number of letters.
-        // This and other cases (involving when to evaluate whether a round is over, when to evaluate the next guess number) show that, in general, my critical sections are pretty much the ENTIRE processing of a response: perhaps I could use more complex global variables with my lock to try to keep threads from interfering with one another, but the goal of this work would pretty much be to serialize 'Guess' messages.
-        // But then, when some functions are expecting the caller to hold the lock and some are not, things get messier.
-        // At the very least, it is simplest to serialize ALL messages, and with very small games such as these this should not incur any measurable performance penalty
-        // Of course, the best way to do this would be to use select/poll, where all requests are serialized and processed in order (no concurrency).
-        // Since I already started pretty far down the thread route, this implementation will use the global lock to essentially re-implement select/poll since refactoring is not feasible.
         pthread_mutex_lock(&global_lock);
-        //printf("[%d] Grabbed lock\n", sockfd);
         int leaving = false;
         json_t *result;
         struct broadcast_message **broadcasts;
 
         // Recv timed out
         if( request == json_null() ){
-            //printf("[%d] Timed out %d vs %d\n", sockfd, (int)time(NULL), (int)deadline);
             // If deadline still in the future, recv again until deadline
             if( is_lobby || !deadline || deadline > time(NULL) ){
-                //printf("[%d] Unlocking...\n", sockfd);
                 pthread_mutex_unlock(&global_lock);
                 continue;
             }
@@ -570,7 +510,6 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
 
         // Recv failed
         if( !request ){
-            //printf("[%d] Recv failed\n", sockfd);
             if( is_lobby ){
                 printf("[Info] Connection with client (via socket %d) broken: unable to recv.\n", sockfd);
                 break;
@@ -584,16 +523,15 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
             // Unless, what's happening is that we DO complete the handshake, but then when I call send again we are attempting to set up another TCP connection? In which case it would expect a connect first, so unsolicited packets are sent RST or, as above, ignored?
             // Anyway, to get around this, we will set the send timeout to 0 for a connection suspected to have failed, so that we will detect an error immediately and not hang.
             // Yea, this didn't work either. Follow up with someone smarter to ask wtf going on.
-            // Resorting to sloop boolean to hack it together
-            ///*
+            // We eventually resorted to a sloppy boolean to hack simply not request on the socket we know to be diconnected.
+            // So, this probably isn't needed anymore.
+            
             struct timeval timeout;
             timeout.tv_sec = 1;
             timeout.tv_usec = 0;
             if( setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0 ){    
-                //printf("[%d] Send timeout set failed\n", sockfd);
                 exit(1);
             }
-            //printf("[%d] Send timeout set to 0\n", sockfd);
             leaving = 2;
         }
 
@@ -601,7 +539,6 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
             char *name = strdup(player_name);
             // Do not include leaving player in future broadcasts or bookkeeping
             json_object_del(player_to_info, get_sock_name(sockfd));
-            //printf("Deleted player info bcast\n");
 
             // Submit dummy guess for this guess set, to trigger another check of the books so other players can move on if everyone else has submitted
             // If we have already submitted this round, this will have no effect
@@ -627,7 +564,6 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
             // Set calls incref on value (respecting the caller's reference) so this should be correct.
             json_object_set_new(result, "Data", json_object());
             json_object_set(result, "Error", request);// json_copy(request));
-            //json_object_set_new(result, "Error", json_copy(request));
             // No broadcasts to send in case of invalid request
             broadcasts = calloc(1, sizeof(struct broadcast_message *));
         }
@@ -642,7 +578,6 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
             printf("[Info] Connection with client (via socket %d) broken: unable to send.\n", sockfd);
             break; // send failed, close cxn
         }
-        //printf("[%d] Finished sending result\n", sockfd);
 
         // Once we have sent PlayerLeave to player, good to exit
         if( !is_lobby && !json_object_size(player_to_info) ){
@@ -654,7 +589,6 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
         for( int msg_idx = 0; broadcasts[msg_idx]; ++msg_idx ){
             broadcast(broadcasts[msg_idx]);
         }
-        //printf("[%d] Finished sending broadcasts\n", sockfd);
 
         json_decref(request);
         json_decref(result);
@@ -675,7 +609,6 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
 
         if( was_start_instance_sent ){
             // Since this thread will transform into the accept thread of the game, we won't every discover the socket we previously attended was shutdown, so just close now
-            //printf("Closing socket %d\n", sockfd);
             close(sockfd);
             transition_to_game();
         }
@@ -687,9 +620,7 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
         // Wait to break down here so that if player leaves on last guess of game the game server will still exit
         if( leaving ) break;
 
-        //printf("[%d] Releasing lock\n", sockfd);
         pthread_mutex_unlock(&global_lock);
-        //printf("[%d] Ready to loop back\n", sockfd);
     }
 
     // When closing socket, we may want to delete a player's info.
@@ -710,17 +641,7 @@ void handle_socket(bool is_lobby, int sockfd, message_handler_t handle_message){
     pthread_mutex_unlock(&global_lock);
     free(state);
 
-    //printf("Closing socket %d\n", sockfd);
     close(sockfd);
-    // Receive next message
-    // If no next message, close socket and return
-    // If client close connection while waiting, seems we'd want to discard info from our bookkeeping records: if someone else has already submitted last join and we've grabbed the lock for that, then we're in trouble bc we'll start the new game but never have enough players because clt has left/won't receive game port
-    // Handler processes message
-    // Lock
-    // If handler gives an individual response, send back to same socket
-    // If handler gives a broadcast response, send to each socket
-    // Unlock
-    // Loop back
 }
 
 const char *get_sock_name(int sockfd){
@@ -741,29 +662,15 @@ bool dump_json(int sockfd, json_t *json){
         fprintf(stdout, "\n");
     }
     
-    ///*
     struct timeval timeout;
     socklen_t len = sizeof(timeout);
     getsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, &len);
-    //printf("[%d] Socket has timeout %ds and %dus\n", sockfd, (int)timeout.tv_sec, (int)timeout.tv_usec);
-    //*/
-    /*
-    while( !strcmp(json_string_value(json_object_get(json, "MessageType")), "PlayerLeave")
-            && send(sockfd, "\n", 1, 0) == 1
-    ){
-        printf("[%d] Sent a newline\n", sockfd);
-    }
-    printf("[%d] Sending newline yields %d\n", sockfd, (int)send(sockfd, "\n", 1, 0)); */
-    //alarm(5);
     char *json_as_str = json_dumps(json, 0);
-    //if( json_dumpfd(json, sockfd, JSON_COMPACT) < 0 || send(sockfd, "\n", 1, 0) != 1 ){ // takes care of sending over TCP (streaming) socket
     if( send(sockfd, json_as_str, strlen(json_as_str), 0) != strlen(json_as_str) || send(sockfd, "\n", 1, 0) != 1 ){ 
         fprintf(stderr, "[Error] Problem sending result back to client. Aborting connection...\n");
         return false;
     }
     free(json_as_str);
-    //alarm(0);
-    //printf("Send stuff with no problem\n");
     return true;
 }
 
@@ -771,31 +678,16 @@ void broadcast(struct broadcast_message *msg){
     const char *player;
     json_t *info;
     json_object_foreach(player_to_info, player, info){
-        //printf("Broadcasting to %s\n", player);
         for( int field_idx = 0; msg->dynamic_data_fields[field_idx]; ++field_idx ){
             struct dynamic_field *field = msg->dynamic_data_fields[field_idx];
             json_object_set_new(json_object_get(msg->message, "Data"), field->name, field->resolver(player));
         }
-        //printf("Resolved dynamic fields for %s\n", player);
-        if( !dump_json(json_integer_value(json_object_get(info, "Sockfd")), msg->message) ) ;//printf("Failed to broadcast to %s\n", player);// If one of these fails, ignore: let the 'owning' socket handle it when it discovers the socket is down
+        if( !dump_json(json_integer_value(json_object_get(info, "Sockfd")), msg->message) ) ; // If one of these fails, ignore: let the 'owning' socket/thread handle it when they discover the socket is down
     }
 }
 
 void lobby_accept_handler(int sockfd){
     generic_accept_handler(true, sockfd, lobby_message_handler);
-    // Create new thread to listen to newly accepted socket and handle messages
-    // Add to global array
-    //  - actually, I now think adding to bookkeeping structures should be handled by MessageType handlers themselves, in case the message is junk and we don't actually wnt to add a new the client to our state
-
-    // if capacity reached, fork and tell clients new address
-    //   manage through static variable? pros/cons vs global?
-    //   also, could just count total number of clients accepted and mod/div by capacity to determine port number (game_port_start + n_clts_accepted/capacity)
-    // create a new thread to listen to this client's socket
-    //   should this just be the default behavior in start_server, i.e., to spawn a listening thread with a specific message handler?
-    //   seems like most general would be an accept handler and the message_handler will be built into the accept handler
-    //   since this isn't python, we can't return a function. But maybe we can be polymorphic in other ways.
-    //
-    // message handler: just forward chats to all players/skts
 }
 
 
@@ -872,11 +764,10 @@ json_t *lobby_message_handler(json_t *message, int sockfd, struct broadcast_mess
 
         int port;
         err = handle_join(player_name, sockfd, &port);
-        //printf("[%d] handle_join port returned: %d\n",sockfd,port);
         if( err ) goto return_error;
 
 
-        // Distinguish cases with 'port': essentially a return code that also indicates new port if positive, or other cases (depending on being 0 or negative
+        // Distinguish cases with 'port': essentially a return code that also indicates new port if positive, or other cases (depending on being 0 or negative)
         
         // Must ensure only one of the parent server and child server processes that return from handle_join sends responses to clients
         //  - philosophy: child server serves as the LOBBY for all joined clients for a short while while it prepares a startinstance message
@@ -894,8 +785,6 @@ json_t *lobby_message_handler(json_t *message, int sockfd, struct broadcast_mess
             
             char my_host[BUFSIZ];
             gethostname(my_host, BUFSIZ);
-            // TODO: err check?
-            // TODO: can we do getsockname on new socket here?
             json_object_set_new(start_instance_data, "Server", json_string(my_host)); // fine (in fact, better) to do this on stack
             json_object_set_new(start_instance_data, "Port", json_integer(port));
             json_object_set_new(start_instance_data, "Nonce", json_null());
@@ -921,17 +810,8 @@ json_t *lobby_message_handler(json_t *message, int sockfd, struct broadcast_mess
     }
 
         return_error: /* LABEL */
-    // TODO: Note in readme that we will include an '.Error' field in our 'Response' message detailing the error encountered if one occurs during processing
     json_object_set_new(response, "Error", json_string(err));
     return response;
-
-
-    // if Join
-    //   individual response = name taken ? reject : accept
-    //   if we will accept player into lobby and thus reach capacity, compute broadcast response (StartInstance)
-    //   else, broadcast result is nothing
-    // if Chat, return message to broadcast and NULL to respond
-    // else, error? send back invalid MessageType or smth of sort?
 }
 
 json_t *resolve_info_field(char *field, const char *player_name){
@@ -977,22 +857,11 @@ char *handle_join(const char *player_name, int sockfd, int *port_out){
         //printf("Ready to fork\n");
         if( fork() ){ // parent
             // Ignore child, go about business
-
-            /* Close connections to lobby clients 
-            //  - making sure previous clients' threads exit is important so superfluous state doesn't build up as server runs over long period
-            //  - we actually don't need to do anything here because the new game server will call SHUTDOWN on all its sockets after it informs them of the new port
-            //  - this shutdown call will awake threads with an error, causing them to close their sockets and exit: see transition_to_game for long-winded explanation
-            const char *player_name;
-            json_t *info;
-            json_object_foreach(player_to_info, player_name, info){
-                //close(json_integer_value(json_object_get(info, "sockfd")));
-                shutdown(json_integer_value(json_object_get(info, "Sockfd")), SHUT_RDWR);
-            }
-            */
             
             /* Cleanup player_to_info so that we don't accumulate leak memory as we fork lobbies */
             json_object_clear(player_to_info);
             
+            // Note: some obsolete concurrency thoughts when I wasn't essentially in select/poll mode yet
             // Note: Interactions with player_to_info-deleting logic in handle_socket are fine
             // E.g.: Lobby locks. Chat message placed in buffers. Lobby forks, returns, and shutsdown each socket and deletes all player info. Lobby unlocks. Thread errs on shutdown socket, locks. Thread sees player_to_info not full (cleared by Lobby), searches player_to_info (nothing there), can't find, doesn't delete anything, unlocks.
 
@@ -1003,7 +872,7 @@ char *handle_join(const char *player_name, int sockfd, int *port_out){
             socklen_t sa_len = sizeof(sa);
             if (getsockname(game_accept_socket, (struct sockaddr *)&sa, &sa_len) == -1) {
                 perror("getsockname() failed");
-                exit(-1); // TODO: anything more intelligent to do in this case?
+                exit(-1);
             }
             *port_out = ntohs(sa.sin_port);
         }
@@ -1013,12 +882,8 @@ char *handle_join(const char *player_name, int sockfd, int *port_out){
 
 
 void transition_to_game(){
-    // TODO: maybe, don't need to close accept socket
-    //  - we won't use the accept socket further, but this game is not designed to be a long-running process, so it will exit relatively soon and OS will close for us
-    // Close accept_socket
-    // To get a handle on it all the way here, gonna cheat/hack and use a global
-    // Needed a global anyway to pass the accept_socket from handle_join to transition_to_game, so before transition I can use this global
-    // close(accept_socket);
+    // In theory, it would be nice to close the accept socket here since we won't be receiving from the original server's addr
+    // However, although we won't use the accept socket further, the game server is not designed to be a long-running process, so it will exit relatively soon and OS will close for us.
            
     // <strikethrough> Close </strikethrough> Shutdown each lobby client socket.
     //   - if indeed a client's chat is received as the last client to hit capacity is joining, we will need to consider the case that we grabbed lock, closed sockets, released lock, chatting clt thd grabs, tries to send, err bc sockets closed
@@ -1034,7 +899,7 @@ void transition_to_game(){
     }
     pthread_mutex_unlock(&global_lock);
     // Start new server with slightly different accept handler
-    srand48(time(NULL));
+    srand48(time(NULL)); // seed here so each game server generates differnt sequencs of words
     start_server(NULL, game_accept_socket, game_accept_handler);
 }
 
@@ -1058,18 +923,9 @@ char *verify_name(const char *player_name, int sockfd){
 /* -------------------- */
 void game_accept_handler(int sockfd){
     generic_accept_handler(false, sockfd, game_message_handler);
-    // Any security to ensure that only expected clients are joining? The nonce I guess, but is this just send in cleartext?
-    // Decision: trigger capacity events when person has joined or when we process their 'join' message?
-    //  - I think best practice would def be when we process their 'join' message (could be some rando sending junk - don't want to start game yet)
-    // Create new thread to listen to this client's skt
-    // Add to global array for broadcasting
-    // message handler:
-    //  - forward chats
-    //  - record guesses from unique players
-    //  - if all guesses received, evaluate vs answer and send results to all
 }
 
-// game_message_dispatcher better name?
+// Note: game_message_dispatcher may be a better name
 // One may note the similar structure of game_message_handler and lobby_message_handler and wonder: is a generalization possible/desirable, taking a specification of functions to invoke for each message_type?
 //  - might be cool, but at some point need to get this project done
 //  - might be desirable if more, similarly structured handlers were expected, but they are not
@@ -1147,9 +1003,8 @@ json_t *game_message_handler(json_t *message, int sockfd, struct broadcast_messa
             goto return_error;
         }
 
-        bool start_game;// = false;
+        bool start_game;
         err = handle_join_instance(player_name, nonce, sockfd, &start_game);
-        //printf("Handled joined instance\n");
         if( err ){
             goto return_error;
         }
@@ -1194,7 +1049,6 @@ json_t *game_message_handler(json_t *message, int sockfd, struct broadcast_messa
         (*broadcasts)[2] = prompt_for_guess_broadcast;
         (*broadcasts)[3] = NULL; // null-terminate the array
         
-        //printf("Constructed star game broadcasts\n");
         return response;
     }
     else if( !strcmp(message_type, "Guess") ){
@@ -1260,17 +1114,6 @@ json_t *game_message_handler(json_t *message, int sockfd, struct broadcast_messa
 
             bool was_winner = false;
             json_object_foreach(player_to_info, player, info){
-            /*
-
-                // If player is leaving, don't include their result
-                if( !strcmp("$%", json_string_value(json_array_get(
-                        json_object_get(info, "RoundGuessHistory"),
-                        json_array_size(json_object_get(info, "RoundGuessHistory") - 1
-                )))) ){
-                    continue;
-                }
-                */
-
                 json_t *last_guess_correct = json_object_get(info, "LastGuessCorrect");
                 json_t *info_to_append = json_object();
                 // Don't steal references, share them
@@ -1376,22 +1219,8 @@ json_t *game_message_handler(json_t *message, int sockfd, struct broadcast_messa
         goto return_error;
     }
         return_error: /* LABEL */
-    // TODO: Note in readme that we will include an '.Error' field in our 'Response' message detailing the error encountered if one occurs during processing
     json_object_set_new(response, "Error", json_string(err));
     return response;
-    // if ladder on MessageType
-    // if JoinInstance
-    //   individual response = name and nonce check out ? accept : reject (JoinInstanceResponse)
-    //   if we will accept player into game and then have everyone compute broadcast response (StartGame)
-    //   else, broadcast result is nothing
-    // if Chat, bcast message and respond nothing (Chat)
-    // if Guess
-    //   individual response based on whethere guess accepted (is correct length and is word?) (GuessResponse)
-    //   if last player to submit guess, broadcast GuessResult: where do PromptForGuess / (EndRound + (StartRound/EndGame)) come in?
-    //     - need some locking to enforce serialization so someone must be last aka avoid race condition and no one realizing they are last
-    //     - idea: maybe return an array of broadcast messages, which should cause all to be broadcasted, in the order they appeared
-    //       - could either have broadcast return value *always* be an array or one can check the type to determine (I think always array makes more sense)
-    //
 }
 
 char *handle_join_instance(const char *player_name, int nonce, int sockfd, bool *start_game_out){
@@ -1403,12 +1232,15 @@ char *handle_join_instance(const char *player_name, int nonce, int sockfd, bool 
         return "Authentication failed: incorrect nonce";
     }
 
-    // TODO: if joined player now joining from a different socket, should we swap to expect messages from this connection instead? (seems reasonable)
+    // NOTE: interesting idea: if joined player now joining from a different socket, should we swap to expect messages from this connection instead? (seems reasonable)
     if( json_object_get(player_info, "Disconnected@") == json_null() ){ // json_null is primitive: no mem leak and comparison works
         return "You've already joined this instance";
     }
     json_object_set_new(player_info, "Sockfd", json_integer(sockfd));
-    // TODO: extension: implement sophisticated disconnect system
+    // Scrapped extension idea: Implement an even sophisticated disconnect system then already present
+    //                          This would extend the timeouts from only guesses to also limiting the amount of time the game server would wait before starting the game
+    //                          However, the current extension was challenge enough and is still pretty cool.
+    //                          The references to "reconnecting" below were some of my first thoughts/steps in this direction.
     //  - set disconnected@ in transition_to_game
     //  - in game server's main accept loop, wait minimum of 60 - (current time - player[disconnected@])
     //  - if we get timeout then, abandon game
@@ -1417,22 +1249,17 @@ char *handle_join_instance(const char *player_name, int nonce, int sockfd, bool 
     //      - idea: when they rejoin: send them startgame, startround, promptforguess as appropriate
     //      - this seems to require that we remember entire history for the round, and include it in promptforguess (or we can have another informative message)
     //  - need similar system for individual clt thds? or should we let chat/gibberish reqs keep the cxn alive?
+    //  - problem: if reconnecting, need some way to check to not trigger start_game_broadcasts to everyone?
+    //      - would be interesting if I could send the stat game broadcast sequence to JUST the reconnecting player
+    //      - might require the broadcast becoming a multicast (be able to specify recipients)
+    //      - otherwise, could detect a reconnect and send a special message containing all info needed to catch up (round number, word length, your guess history, all players' results history, guess number)
     json_object_set_new(player_info, "Disconnected@", json_null());
     
     // If a player is reconnecting, do not reset their round guess history
     if( !json_object_get(player_info, "RoundGuessHistory") ){
         json_object_set_new(player_info, "RoundGuessHistory", json_array());
     }
-    // If player is reconnecting, reuse their previously assigned number
-    /*
-    if( !json_object_get(player_info, "Number") ){
-    }
-    */
 
-    // TODO: if reconnecting, need some way to check to not trigger start_game_broadcasts to everyone?
-    // - would be interesting if I could send the stat game broadcast sequence to JUST the reconnecting player
-    // - might require the broadcast becoming a multicast (be able to specify recipients)
-    // - otherwise, could detect a reconnect and send a special message containing all info needed to catch up (round number, word length, your guess history, all players' results history, guess number)
     *start_game_out = true;
     const char *player;
     json_t *info;
@@ -1454,13 +1281,21 @@ char *handle_join_instance(const char *player_name, int nonce, int sockfd, bool 
         json_object_foreach(player_to_info, player, info){
             json_object_set(info, "GuessDeadline", deadline);
         }
-        //printf("Set deadline to %d\n", (int)json_integer_value(deadline));
         json_decref(deadline);
     }
 
     return NULL;
 }
 
+/*
+ * rc return values:
+ *   0: guess did not complete current guess set
+ *   1: guess completed current guess set but did not complete round
+ *   2: guess completed current guess set and completed round but did not complete game
+ *   2: guess completed current guess set and completed round and completed game
+ *
+ *   We return player_leave here so the higher level dispatcher/marshaller does not need any semantic knowledge of guess
+ */
 char *handle_guess(const char *player_name, const char *guess, int sockfd, int *rc, bool *player_leave){
     *player_leave = !strcmp(guess, "$%");
     // If player left, don't bookkeep their nonexistant records, just check again if we've reached end of round now that this player's records are gone
@@ -1535,7 +1370,6 @@ char *handle_guess(const char *player_name, const char *guess, int sockfd, int *
             json_object_set(info, "GuessDeadline", deadline);
             json_object_del(info, "LastGuess@");
         }
-        //printf("Set deadline to %d\n", (int)json_integer_value(deadline));
         json_decref(deadline);
     }
     return NULL;
@@ -1564,21 +1398,6 @@ int score_round(json_t *round_guess_history){
         );
 }
 
-// We have determined that no locking is necessary in this function.
-//  - when starting game, locking not needed: locking in handle_join_instance ensures only one player can think they are last to join and initiate start game procedure.
-//  - when ending round, locking not needed: locking in handle_guess ensures only one player can think they are last to guess and initiate end guess set procedure, and perhaps end round and end game procedures, too.
-//  - nowhere else do we modify score, and we only read it when sending end game message to all, which will only be called from the same thread, after start_next_round is complete
-//  - this is to say: this function can only be being executed
-//  thought xpr: last player submission received, then ALL players submit in the background, start this fxn, cxt swt and process each player's guess, find that someone is last, and then enter here from another thread
-
-// NOTE: after some thought, select/poll makes way more sense for this project
-// Consider the following scenario in a 2-player game
-//  1) Player 1 submits guess: p1 thread processes it without issue.
-//  2) Player 2 submits guess: p2 locks, records guess in global, unlocks
-//  3) Player 1 submits unsolicited guess (assuming the worst): suppose p1 thread then grabs the lock (BEFORE p2 can grab it to run start_next_round), sees p1 and p2 have same number of guesses, assesses p1's guess against the WRONG reference word - the next word to be chosen by start_next_round may have a different number of letters.
-// This and other cases (involving when to evaluate whether a round is over) show that, in general, my critical sections are pretty much the ENTIRE processing of a response.
-// So, what would make the MOST sense is to use select/poll where requests are serialized so that they do not interfere with each other in this way.
-// This implementation will essentially be re-implementing select/poll in a hackish way since due to time constraints we cannot refactor into a select/poll method.
 void start_next_round(){
     const char *player;
     json_t *info;
@@ -1616,7 +1435,6 @@ char *select_word(){
     }
     char *uppercase_selected = strdup(selected);
     for(int i = 0; i < strlen(selected); i++) uppercase_selected[i] = toupper(selected[i]);
-    //printf("WORD FOR ROUND: %s\n", uppercase_selected);
     return uppercase_selected;
 }
 
@@ -1732,6 +1550,7 @@ char *compute_wordle_result(const char *guess, const char *answer){
 }
 
 // Double pointer to state so we can read/write it.
+// This is a re-entrant version of my get_next_request from the previous project (using static variables, which I somehow did not predict would get ugly with threading).
 // *state MUST be initialized to NULL on first invocation.
 json_t *get_next_request_r(int sockfd, struct timeval *timeout, void **state_ptr){
     if( !*state_ptr ){
@@ -1805,7 +1624,6 @@ json_t *get_next_request_r(int sockfd, struct timeval *timeout, void **state_ptr
         }
 
         // Receive more data to try to find end of request
-        //printf("[%d] ABOUT TO RECV: OFFSET %ld, UP TO %d\n", sockfd, unused_buffer_start - buffer, space_remaining);
         // If timeout NULL, set timeout to 0, which causes recv to never timeout
         struct timeval tv;
         if( timeout ) tv = *timeout;
@@ -1816,7 +1634,6 @@ json_t *get_next_request_r(int sockfd, struct timeval *timeout, void **state_ptr
         setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
          
         int got = recv(sockfd, unused_buffer_start, space_remaining, 0);
-        //printf("[%d] RETURNED FROM RECV: GOT %d\n", sockfd, got);
         if( got < 0 ){
             if( errno == EAGAIN || errno == EWOULDBLOCK ) return json_null();
             perror("[Error] Could not receive from client");
@@ -1827,12 +1644,6 @@ json_t *get_next_request_r(int sockfd, struct timeval *timeout, void **state_ptr
         }
         space_remaining -= got;
         
-        //printf("[%d] BUFFER (length %d, %d remaining) \n\t|%.*s|\n", sockfd, current_bufsiz_multiple * BUFSIZ - space_remaining, space_remaining, current_bufsiz_multiple * BUFSIZ - space_remaining, buffer);
-
-        //printf("[%d] BUFFER \n\t|", sockfd);
-        //for( int i = 0; i < current_bufsiz_multiple * BUFSIZ - space_remaining; ++i)
-            //printf("(%c, %d)", buffer[i], buffer[i]);
-        //printf("|\n");
     } while(true);
 }
 
@@ -1845,4 +1656,3 @@ bool str_to_int(const char *str, int *int_out){
     if( int_out ) *int_out = res;
     return true;
 }
-
