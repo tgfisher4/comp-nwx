@@ -1,4 +1,5 @@
-#! /usr/bin/env python3
+#! /escnfs/home/pbui/pub/pkgsrc/bin/python3
+###! /usr/bin/env python3
 ''' Wordle client '''
 ''' Jason Brown, Graham Fisher, Tommy Gallagher '''
 
