@@ -25,3 +25,4 @@ To learn about available and required options, invoke `cd mpwordle && ./mpwordle
  - The client assumes the terminal window is sufficiently large (doesn't actually have to be that big, but we recommend full screen).
  - When the client terminal window is small enough that a line of text wraps around the terminal window, the tail of this line hanging into the next is overwritten by the next line.
  - The client assumes that the maximum timeout for a guess is 999 (it can only display 3 digits of a timer).
+ - ncurses and tmux don't seem to play nice: please use a dedicated terminal window to run the client.
