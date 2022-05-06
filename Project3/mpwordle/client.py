@@ -384,7 +384,10 @@ class WordleClient:
         self.curr_chatln = 1
         while True:
             # Better than for loop: allows dynamic changing of skt from lobby -> game server
-            msg = next(self.skt_msgs)
+            try:
+                msg = next(self.skt_msgs)
+            except StopIteration:
+                break
             
             # display chat messages/new game state 
             self.process_msg(json.loads(msg))

@@ -257,8 +257,16 @@ bool process_args(int argc, char **argv){
     longopts[6] = timeout_seconds_opt;
     longopts[7] = sentinel;
 
-    char *dict_filename = "wordle-answers-alphabetical.txt";
+
+    char dft_dict_path[BUFSIZ];
+    readlink("/proc/self/exe", dft_dict_path, BUFSIZ);
+    char *last_slash = strrchr(dft_dict_path, '/');
+    char *dft_dict_filename = "wordle-answers-alphabetical.txt";
+    strcpy(last_slash+1, dft_dict_filename);
+
+    char* dict_path = dft_dict_path;
     int val, idx;
+    opterr = 1;
     while( (val = getopt_long_only(argc, argv, "", longopts, &idx)) > -1 ){
         switch(val){
             case 0:
@@ -290,7 +298,7 @@ bool process_args(int argc, char **argv){
                 }
                 break;
             case 4:
-                dict_filename = optarg;
+                dict_path = optarg;
                 break;
             case 5:
                 DEBUG = true;
@@ -302,9 +310,9 @@ bool process_args(int argc, char **argv){
                 }
                 break;
             default:
-                printf("[INFO] Somehow reached default in process_args switch (val was %d)\n", val);
+                //fprintf(stderr, "[Error] Unrecognized option %s\n", argv[optind]);
                 return false;
-                break; // impossible
+                break;
         }
     }
     if( optind != argc ){
@@ -313,7 +321,7 @@ bool process_args(int argc, char **argv){
     }
 
     // Open and validate dictionary file
-    DICT_FILE = fopen(dict_filename, "r");
+    DICT_FILE = fopen(dict_path, "r");
     if( !DICT_FILE ){
         perror("couldn't open dictionary file");
         return false;

@@ -1,4 +1,4 @@
-TARGETS= mpwordle/mpwordle mpwordleserver/mpwrodleserver
+TARGETS= mpwordle/mpwordle mpwordleserver/mpwordleserver
 
 all: $(TARGETS)
 
